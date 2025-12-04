@@ -22,6 +22,7 @@ from miles.utils.metric_utils import compute_rollout_step
 from miles.utils.misc import load_function
 from miles.utils.ppo_utils import (
     compute_approx_kl,
+    compute_cispo_loss,
     compute_gspo_kl,
     compute_opsm_mask,
     compute_policy_loss,
@@ -540,7 +541,7 @@ class FSDPTrainRayActor(TrainRayActor):
             )
 
     def _train_core(self, rollout_id: int, rollout_data) -> None:
-        if self.args.advantage_estimator in ["grpo", "gspo"]:
+        if self.args.advantage_estimator in ["grpo", "gspo", "cispo"]:
             rollout_data["advantages"] = rollout_data["returns"] = [
                 torch.tensor([rollout_data["rewards"][i]] * rollout_data["response_lengths"][i])
                 for i in range(len(rollout_data["rewards"]))
@@ -649,7 +650,11 @@ class FSDPTrainRayActor(TrainRayActor):
                 loss_masks=loss_masks,
             )
 
-        pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, self.args.eps_clip, self.args.eps_clip_high)
+        if self.args.advantage_estimator == "cispo":
+            # CISPO: clipping with stop-gradient on IS ratio
+            pg_loss, pg_clipfrac = compute_cispo_loss(ppo_kl, log_probs, advantages, self.args.eps_clip, self.args.eps_clip_high)
+        else:
+            pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, self.args.eps_clip, self.args.eps_clip_high)
 
         if self.args.use_opsm:
             pg_loss = pg_loss * opsm_mask
