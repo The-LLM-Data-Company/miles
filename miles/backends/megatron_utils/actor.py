@@ -179,7 +179,11 @@ class MegatronTrainRayActor(TrainRayActor):
             mpu.get_data_parallel_world_size(with_context_parallel=False),
         )
 
-        if getattr(self.args, "pipeline_rl", False) and "weight_version_last" in rollout_data:
+        if (
+            getattr(self.args, "pipeline_rl", False)
+            and "weight_version_last" in rollout_data
+            and hasattr(self, "weight_updater")
+        ):
             last_versions_raw = rollout_data["weight_version_last"]
             current_version = self.weight_updater.weight_version
             last_versions = []
