@@ -480,6 +480,31 @@ class FSDPTrainRayActor(TrainRayActor):
 
         with inverse_timer("train_wait"), timer("train"):
             rollout_data = process_rollout_data(self.args, rollout_data_ref, self.dp_rank, self.dp_size)
+
+            if getattr(self.args, "pipeline_rl", False) and "weight_version_last" in rollout_data:
+                last_versions_raw = rollout_data["weight_version_last"]
+                current_version = self.weight_updater.weight_version
+                last_versions = []
+                for v in last_versions_raw:
+                    if v is None:
+                        last_versions.append(current_version)
+                        continue
+                    try:
+                        last_versions.append(int(v))
+                    except (TypeError, ValueError):
+                        last_versions.append(current_version)
+
+                lags = [current_version - v for v in last_versions]
+                rollout_data["weight_lag"] = lags
+
+                max_lag = getattr(self.args, "pipeline_max_weight_lag", None)
+                if max_lag is not None:
+                    keep_idx = [i for i, lag in enumerate(lags) if lag <= max_lag]
+                    if len(keep_idx) < len(lags):
+                        num_samples = len(lags)
+                        for key, val in list(rollout_data.items()):
+                            if isinstance(val, list) and len(val) == num_samples:
+                                rollout_data[key] = [val[i] for i in keep_idx]
             if self.args.debug_rollout_only:
                 return
             self._train_core(rollout_id=rollout_id, rollout_data=rollout_data)

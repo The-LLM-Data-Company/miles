@@ -708,6 +708,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "gspo",
                     "reinforce_plus_plus",
                     "reinforce_plus_plus_baseline",
+                    "policy_gradient_is",
                     "ppo",
                     "on_policy_distillation",
                 ],
@@ -808,6 +809,32 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 default=None,
                 help="Path to the custom TIS/RS function (e.g., examples/train_infer_mismatch_helper/mis.py:compute_mis_weights_with_cp).",
+            )
+
+            parser.add_argument(
+                "--pipeline-rl",
+                action="store_true",
+                default=False,
+                help="Enable PipelineRL-style in-flight weight update and staleness-aware async RL.",
+            )
+            parser.add_argument(
+                "--pipeline-weight-update-interval",
+                type=int,
+                default=1,
+                help="Trainer steps between weight update pushes to inference servers.",
+            )
+            parser.add_argument(
+                "--pipeline-max-weight-lag",
+                type=int,
+                default=4,
+                help="Max allowed weight_version lag between trainer and samples; staler samples are dropped.",
+            )
+            parser.add_argument(
+                "--disable-pipeline-pause-wait-safe",
+                action="store_false",
+                dest="pipeline_pause_wait_safe",
+                default=True,
+                help="Disable requiring a blocking pause safe-point before in-place weight mutation.",
             )
 
             parser.add_argument(
@@ -1418,6 +1445,12 @@ def miles_validate_args(args):
 
     if args.use_rollout_logprobs:
         assert not args.use_tis, "use_rollout_logprobs and use_tis cannot be set at the same time."
+
+    if getattr(args, "pipeline_rl", False):
+        if args.pipeline_weight_update_interval <= 0:
+            raise ValueError("pipeline_weight_update_interval must be > 0 when pipeline_rl is enabled")
+        if args.pipeline_max_weight_lag < 0:
+            args.pipeline_max_weight_lag = 0
 
     if args.get_mismatch_metrics:
         assert (

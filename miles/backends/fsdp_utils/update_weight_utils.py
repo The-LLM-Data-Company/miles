@@ -1,6 +1,7 @@
 import abc
 import logging
 import socket
+import time
 from argparse import Namespace
 from collections.abc import Sequence
 
@@ -33,6 +34,7 @@ class UpdateWeight(abc.ABC):
     def __init__(self, args: Namespace, model: torch.nn.Module) -> None:
         self.args = args
         self.model = model
+        self.weight_version = 0
 
     @abc.abstractmethod
     def connect_rollout_engines(
@@ -43,6 +45,13 @@ class UpdateWeight(abc.ABC):
         pass
 
     def update_weights(self) -> None:
+        self.weight_version += 1
+
+        if dist.get_rank() == 0 and getattr(self.args, "pipeline_rl", False):
+            ray.get([engine.pause_generation.remote(mode="in_place") for engine in self.rollout_engines])
+            self._wait_pause_safe()
+        dist.barrier()
+
         bucket = []
         bucket_size = 0
         for name, param in self.model.state_dict().items():
@@ -68,6 +77,37 @@ class UpdateWeight(abc.ABC):
             del bucket
             bucket = []
             bucket_size = 0
+
+        dist.barrier()
+
+        if dist.get_rank() == 0 and getattr(self.args, "pipeline_rl", False):
+            self._verify_weight_versions(expected_version=self.weight_version)
+            ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
+        dist.barrier()
+
+    def _wait_pause_safe(self) -> None:
+        if not getattr(self.args, "pipeline_pause_wait_safe", True):
+            return
+
+        start_time = time.time()
+        sleep_s = 0.01
+        while True:
+            try:
+                ray.get([engine.get_weight_version.remote() for engine in self.rollout_engines])
+                return
+            except Exception:
+                if time.time() - start_time > 5.0:
+                    return
+                time.sleep(sleep_s)
+                sleep_s = min(sleep_s * 2, 0.5)
+
+    def _verify_weight_versions(self, expected_version: int) -> None:
+        expected = str(expected_version)
+        versions = ray.get([engine.get_weight_version.remote() for engine in self.rollout_engines])
+        normalized = [str(v) for v in versions if v is not None]
+        mismatched = [v for v in normalized if v != expected]
+        if mismatched:
+            raise RuntimeError(f"PipelineRL engine weight_version mismatch: expected={expected}, got={normalized}")
 
     def wait_and_update_bucket_weights(self, bucket):
         bucket = [(name, param.wait()) if hasattr(param, "wait") else (name, param) for name, param in bucket]
@@ -162,11 +202,12 @@ class UpdateWeightFromTensor(UpdateWeight):
                     "serialized_named_tensors": [tensors[i] for tensors in gathered_serialized_batches],
                     "load_format": "flattened_bucket",
                     "flush_cache": False,
+                    "weight_version": str(self.weight_version),
                 }
                 ref = self._ipc_engine.update_weights_from_tensor.remote(**kwargs)
                 ray.get(ref)
 
-        if dist.get_rank() == self._ipc_gather_src:
+        if dist.get_rank() == self._ipc_gather_src and not getattr(self.args, "pipeline_rl", False):
             ref = self._ipc_engine.flush_cache.remote()
             ray.get(ref)
 
@@ -229,30 +270,52 @@ class UpdateWeightFromDistributed(UpdateWeight):
         if not self._is_src_rank or not named_tensors:
             return
 
-        refs = [
-            engine.update_weights_from_distributed.remote(
-                names=[name for name, _ in named_tensors],
-                dtypes=[param.dtype for _, param in named_tensors],
-                shapes=[param.shape for _, param in named_tensors],
-                group_name=self._group_name,
-            )
-            for engine in self.rollout_engines
-        ]
-
         handles = []
-        # Broadcast parameters one by one with memory management
-        for _name, param in named_tensors:
-            torch.cuda.empty_cache()
-            # Ensure tensor is contiguous and on the right device
-            param_data = param.data.contiguous()
+        if getattr(self.args, "pipeline_rl", False):
+            named_tensors_by_dtype = {}
+            for name, tensor in named_tensors:
+                named_tensors_by_dtype.setdefault(tensor.dtype, []).append((name, tensor))
 
-            # avoid `DTensor._op_dispatcher.dispatch` has `assert compute_mesh is not None` error
-            if dist.get_world_size() == 1 and isinstance(param_data, DTensor):
-                param_data = param_data.full_tensor()
+            for _, dtype_named_tensors in named_tensors_by_dtype.items():
+                refs = [
+                    engine.update_weights_from_distributed.remote(
+                        names=[name for name, _ in dtype_named_tensors],
+                        dtypes=[param.dtype for _, param in dtype_named_tensors],
+                        shapes=[param.shape for _, param in dtype_named_tensors],
+                        group_name=self._group_name,
+                        weight_version=str(self.weight_version),
+                        load_format="flattened_bucket",
+                    )
+                    for engine in self.rollout_engines
+                ]
+                bucket = FlattenedTensorBucket(named_tensors=dtype_named_tensors)
+                flattened_tensor = bucket.get_flattened_tensor()
+                dist.broadcast(flattened_tensor, 0, group=self._model_update_groups)
+                ray.get(refs)
+        else:
+            refs = [
+                engine.update_weights_from_distributed.remote(
+                    names=[name for name, _ in named_tensors],
+                    dtypes=[param.dtype for _, param in named_tensors],
+                    shapes=[param.shape for _, param in named_tensors],
+                    group_name=self._group_name,
+                    weight_version=str(self.weight_version),
+                )
+                for engine in self.rollout_engines
+            ]
 
-            # Synchronous broadcast to avoid memory buildup
-            handles.append(dist.broadcast(param_data, 0, group=self._model_update_groups, async_op=True))
+            for _name, param in named_tensors:
+                torch.cuda.empty_cache()
+                # Ensure tensor is contiguous and on the right device
+                param_data = param.data.contiguous()
 
-        for handle in handles:
-            handle.wait()
-        ray.get(refs)
+                # avoid `DTensor._op_dispatcher.dispatch` has `assert compute_mesh is not None` error
+                if dist.get_world_size() == 1 and isinstance(param_data, DTensor):
+                    param_data = param_data.full_tensor()
+
+                # Synchronous broadcast to avoid memory buildup
+                handles.append(dist.broadcast(param_data, 0, group=self._model_update_groups, async_op=True))
+
+            for handle in handles:
+                handle.wait()
+            ray.get(refs)

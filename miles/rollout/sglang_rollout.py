@@ -144,6 +144,7 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
 
     output = await post(url, payload)
 
+
     # Extract new response tokens
 
     if args.use_miles_router and "RadixTreeMiddleware" in args.miles_router_middleware_paths:
@@ -159,11 +160,22 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         sample.rollout_log_probs = retrieve_output["rollout_logp"][-sample.response_length :]
         # Notice: currently cannot get the spec info from radix router output.
     else:
-        if "output_token_logprobs" in output["meta_info"]:
+        need_rollout_log_probs = (
+            args.use_tis
+            or args.use_rollout_logprobs
+            or args.get_mismatch_metrics
+            or getattr(args, "pipeline_rl", False)
+        )
+        if "output_token_logprobs" not in output["meta_info"]:
+            if need_rollout_log_probs:
+                raise RuntimeError(
+                    "SGLang rollout did not return output_token_logprobs, but off-policy correction is enabled"
+                )
+            new_response_tokens, new_response_log_probs = [], []
+        else:
             new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
             new_response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
-        else:
-            new_response_tokens, new_response_log_probs = [], []
+            assert len(new_response_tokens) == len(new_response_log_probs)
 
         # Update sample with tokens directly - avoiding re-tokenization
         sample.tokens = sample.tokens + new_response_tokens
