@@ -48,6 +48,8 @@ class AsyncRolloutWorker:
         self.output_queue = queue.Queue(maxsize=1000)  # Continuous output queue
         self.worker_thread = None
         self.state = GenerateState(args)
+        # Priority queue for groups with partial completions from aborted requests (thread-safe)
+        self.partial_queue = queue.Queue(maxsize=1000)
 
     async def continuous_worker_loop(self):
         """Continuous work loop - constantly get data from data_buffer and process"""
@@ -71,7 +73,12 @@ class AsyncRolloutWorker:
 
                 # If active task count hasn't reached limit, try to get new data and start tasks
                 while len(active_tasks) < max_concurrent_tasks and self.running:
-                    samples = self.data_buffer.get_samples(1)
+                    # Pull from partial queue first (priority), then from data_buffer
+                    try:
+                        group = self.partial_queue.get_nowait()
+                        samples = [group]
+                    except queue.Empty:
+                        samples = self.data_buffer.get_samples(1)
 
                     for group in samples:
                         group_id = group_id_counter
@@ -193,21 +200,30 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> list[lis
 
             group = completed_groups.pop(group_id)
 
-            # If any sample in the group was aborted, return the whole group to the data buffer
-            # and do not forward it to the training engine.
+            # Handle partial completions: check if group has any incomplete samples
             try:
-                any_aborted = any([sample.status == Sample.Status.ABORTED for sample in group])
-            except Exception:
-                any_aborted = False
+                completed_samples = [s for s in group if s.status in [Sample.Status.COMPLETED, Sample.Status.TRUNCATED]]
+                aborted_samples = [s for s in group if s.status == Sample.Status.ABORTED]
 
-            if any_aborted:
-                try:
-                    # add back to buffer so it can be retried or handled by buffer policy
-                    data_buffer.add_samples([group])
-                    print(f"Returned aborted group {group_id} to data buffer", flush=True)
-                except Exception as e:
-                    print(f"Failed to return aborted group {group_id} to buffer: {e}", flush=True)
-                # don't count as processed for training
+                has_completed = len(completed_samples) > 0
+                has_incomplete = len(aborted_samples) > 0
+
+                # If group has incomplete samples, re-enqueue to priority queue
+                if has_incomplete:
+                    # Re-enqueue to worker's partial queue (processed with priority)
+                    # Completed samples will be skipped by generate_and_rm (sglang_rollout.py:209-213)
+                    worker.partial_queue.put(group)
+                    if has_completed:
+                        print(f"Re-enqueued partial group {group_id} to priority queue ({len(completed_samples)}/{len(group)} completed)", flush=True)
+                    else:
+                        print(f"Re-enqueued aborted group {group_id} to priority queue (0/{len(group)} completed)", flush=True)
+                    # Don't count as processed for training yet
+                    continue
+
+                # If all samples completed, process normally below
+            except Exception as e:
+                print(f"Error checking group {group_id} completion status: {e}", flush=True)
+                # On error, skip this group
                 continue
 
             if do_print:
