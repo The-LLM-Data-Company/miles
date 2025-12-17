@@ -830,14 +830,6 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="Max allowed weight_version lag between trainer and samples; staler samples are dropped.",
             )
             parser.add_argument(
-                "--disable-pipeline-pause-wait-safe",
-                action="store_false",
-                dest="pipeline_pause_wait_safe",
-                default=True,
-                help="Disable requiring a blocking pause safe-point before in-place weight mutation.",
-            )
-
-            parser.add_argument(
                 "--use-routing-replay",
                 action="store_true",
                 default=False,
@@ -1537,6 +1529,14 @@ def miles_validate_args(args):
 
     if args.eval_function_path is None:
         args.eval_function_path = args.rollout_function_path
+
+    # PipelineRL rollout mode: by default, switch to the inflight rollout implementation.
+    if getattr(args, "pipeline_rl", False) and args.rollout_function_path == "miles.rollout.sglang_rollout.generate_rollout":
+        args.rollout_function_path = "miles.rollout.pipelinerl_rollout.generate_rollout"
+        logger.info(
+            "pipeline_rl enabled; overriding rollout_function_path to "
+            f"{args.rollout_function_path}. (Set --rollout-function-path explicitly to override.)"
+        )
 
     if args.num_steps_per_rollout is not None:
         global_batch_size = args.rollout_batch_size * args.n_samples_per_prompt // args.num_steps_per_rollout

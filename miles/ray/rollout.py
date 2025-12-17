@@ -14,7 +14,6 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from miles.backends.sglang_utils.sglang_engine import SGLangEngine
 from miles.rollout.base_types import call_rollout_fn
-from miles.rollout.inflight_actor import InflightRolloutGenerator
 from miles.utils import tracking_utils
 from miles.utils.health_monitor import RolloutHealthMonitor
 from miles.utils.http_utils import _wrap_ipv6, find_available_port, get_host_info, init_http_client
@@ -54,10 +53,6 @@ class RolloutManager:
         data_source_cls = load_function(self.args.data_source_path)
         self.data_source = data_source_cls(args)
 
-        self._pipeline_inflight = None
-        if getattr(self.args, "pipeline_rl", False) and not self.args.debug_train_only:
-            self._pipeline_inflight = InflightRolloutGenerator(self.args, self.data_source.get_samples)
-
         self.generate_rollout = load_function(self.args.rollout_function_path)
         self.eval_generate_rollout = load_function(self.args.eval_function_path)
         self.custom_reward_post_process_func = None
@@ -76,16 +71,11 @@ class RolloutManager:
         self.nodes_per_engine = max(1, args.rollout_num_gpus_per_engine // args.num_gpus_per_node)
         self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
 
-        if self._pipeline_inflight is not None:
-            self._pipeline_inflight.start()
-
         self._metric_checker = MetricChecker.maybe_create(args)
         if self.args.use_fault_tolerance:
             self._health_monitor = RolloutHealthMonitor(self, args)
 
     def dispose(self):
-        if self._pipeline_inflight is not None:
-            self._pipeline_inflight.stop()
         if self._metric_checker is not None:
             self._metric_checker.dispose()
 
@@ -150,17 +140,6 @@ class RolloutManager:
         return ray.get([engine.get_weight_version.remote() for engine in self.rollout_engines])
 
     def _get_rollout_data(self, rollout_id):
-        if getattr(self.args, "pipeline_rl", False) and self._pipeline_inflight is not None:
-            groups, metrics = self._pipeline_inflight.get_next_groups(self.args.rollout_batch_size)
-            samples = []
-            for group in groups:
-                if isinstance(group[0], list):
-                    samples += sum(group, [])
-                else:
-                    samples += group
-            samples = sorted(samples, key=lambda sample: sample.index)
-            return samples, metrics
-
         if self.args.load_debug_rollout_data:
             data = torch.load(
                 open(self.args.load_debug_rollout_data.format(rollout_id=rollout_id), "rb"),

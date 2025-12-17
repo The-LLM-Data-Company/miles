@@ -84,8 +84,7 @@ class UpdateWeightFromDistributed:
 
         if dist.get_rank() == 0:
             if getattr(self.args, "pipeline_rl", False):
-                ray.get([engine.pause_generation.remote(mode="in_place") for engine in self.rollout_engines])
-                self._wait_pause_safe()
+                ray.get([engine.pause_generation.remote(mode="in_place_safe") for engine in self.rollout_engines])
             else:
                 ray.get([engine.pause_generation.remote(mode="abort") for engine in self.rollout_engines])
                 ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
@@ -128,22 +127,6 @@ class UpdateWeightFromDistributed:
         if dist.get_rank() == 0:
             ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
-
-    def _wait_pause_safe(self) -> None:
-        if not getattr(self.args, "pipeline_pause_wait_safe", True):
-            return
-
-        start_time = time.time()
-        sleep_s = 0.01
-        while True:
-            try:
-                ray.get([engine.get_weight_version.remote() for engine in self.rollout_engines])
-                return
-            except Exception:
-                if time.time() - start_time > 5.0:
-                    return
-                time.sleep(sleep_s)
-                sleep_s = min(sleep_s * 2, 0.5)
 
     def _verify_weight_versions(self, expected_version: int) -> None:
         expected = str(expected_version)
