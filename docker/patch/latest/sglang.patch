@@ -1409,7 +1409,7 @@ index 4d58278b7..8f50dc430 100644
          ):
              self.model = get_model(
                  model_config=self.model_config,
-@@ -1186,14 +1186,30 @@ class ModelRunner:
+@@ -1186,6 +1186,22 @@ class ModelRunner:
              for handle in handles:
                  handle.wait()
  
@@ -1441,7 +1441,7 @@ index 4d58278b7..8f50dc430 100644
              )
              logger.error(error_msg)
              return False, error_msg
-@@ -1218,12 +1235,28 @@ class ModelRunner:
+@@ -1218,6 +1234,22 @@ class ModelRunner:
              )
              reconstructed_tensors = bucket.reconstruct_tensors()
              self.model.load_weights(reconstructed_tensors)
@@ -2143,7 +2143,7 @@ index e71bfce48..eae0ead86 100644
  class ContinueGenerationReqInput(BaseReq):
      pass
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index db884c4a2..f3488cd9f 100644
+index 075f26df3..340141983 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
 @@ -96,6 +96,7 @@ from sglang.srt.managers.io_struct import (
@@ -2154,7 +2154,7 @@ index db884c4a2..f3488cd9f 100644
      ProfileReq,
      ReleaseMemoryOccupationReqInput,
      ResumeMemoryOccupationReqInput,
-@@ -2513,7 +2514,7 @@ class Scheduler(
+@@ -2497,7 +2498,7 @@ class Scheduler(
  
          if self.last_batch and self.last_batch.forward_mode.is_extend():
              chunked_req_to_exclude = set()
@@ -2163,7 +2163,7 @@ index db884c4a2..f3488cd9f 100644
                  if self.chunked_req is not None:
                      chunked_req_to_exclude.add(self.chunked_req)
              self.last_batch.filter_batch(
-@@ -2534,6 +2535,27 @@ class Scheduler(
+@@ -2518,6 +2519,27 @@ class Scheduler(
              self.running_batch.batch_is_full = False
              self.chunked_req = None
  
@@ -2192,11 +2192,10 @@ index db884c4a2..f3488cd9f 100644
          self._engine_paused = False
  
 diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
-index 4c5134ac3..178093d9d 100644
+index 4c5134ac3..7c6e8e3a4 100644
 --- a/python/sglang/srt/managers/tokenizer_manager.py
 +++ b/python/sglang/srt/managers/tokenizer_manager.py
- 
-@@ -1172,9 +1181,35 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
+@@ -1172,19 +1172,35 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
              )
  
      async def pause_generation(self, obj: PauseGenerationReqInput):
@@ -2257,10 +2256,10 @@ index ec9ae1d3d..0fc905eaa 100644
              worker.send_pyobj(obj)
  
 diff --git a/python/sglang/srt/managers/tokenizer_communicator_mixin.py b/python/sglang/srt/managers/tokenizer_communicator_mixin.py
-index 000000000..000000000 100644
+index a5626f0b7..c8a55f72c 100644
 --- a/python/sglang/srt/managers/tokenizer_communicator_mixin.py
 +++ b/python/sglang/srt/managers/tokenizer_communicator_mixin.py
-@@ -48,6 +48,7 @@ from sglang.srt.managers.io_struct import (
+@@ -49,6 +49,7 @@ from sglang.srt.managers.io_struct import (
      LoadLoRAAdapterReqOutput,
      LoRAUpdateOutput,
      OpenSessionReqInput,
@@ -2268,7 +2267,8 @@ index 000000000..000000000 100644
      ProfileReq,
      ProfileReqOutput,
      ProfileReqType,
-@@ -157,5 +158,8 @@ class TokenizerCommunicatorMixin:
+@@ -156,6 +157,9 @@ class TokenizerCommunicatorMixin:
+ 
      def init_communicators(self: TokenizerManager, server_args: ServerArgs):
          # Communicators
 +        self.pause_generation_communicator = _Communicator(
@@ -2277,7 +2277,7 @@ index 000000000..000000000 100644
          self.init_weights_update_group_communicator = _Communicator(
              self.send_to_scheduler, server_args.dp_size
          )
-@@ -222,7 +226,11 @@ class TokenizerCommunicatorMixin:
+@@ -222,6 +226,10 @@ class TokenizerCommunicatorMixin:
      def _get_communicator_dispatcher(self: TokenizerManager):
          return TypeBasedDispatcher(
              [
