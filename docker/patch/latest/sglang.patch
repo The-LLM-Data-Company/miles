@@ -1409,38 +1409,7 @@ index 4d58278b7..8f50dc430 100644
          ):
              self.model = get_model(
                  model_config=self.model_config,
-@@ -2645,9 +2692,12 @@ class ModelRunner:
-     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
-         self.forward_pass_id += 1
- 
--        with get_global_expert_distribution_recorder().with_forward_pass(
--            self.forward_pass_id,
--            forward_batch,
-+        with (
-+            get_global_expert_distribution_recorder().with_forward_pass(
-+                self.forward_pass_id,
-+                forward_batch,
-+            ),
-+            get_global_experts_capturer().with_forward(forward_batch),
-         ):
-             output = self._forward_raw(
-                 forward_batch,
-@@ -2656,6 +2706,13 @@ class ModelRunner:
-                 reinit_attn_backend,
-                 split_forward_count,
-             )
-+            # Copy cached routing experts' buffers back to CPU cache
-+            get_global_experts_capturer().sync_fwd_experts_buffer_DtoH(
-+                device_loc=forward_batch.out_cache_loc,
-+                cpu_loc=forward_batch.out_cache_loc_cpu,
-+                can_run_graph=output[1],
-+                cuda_graph_batch=getattr(self.graph_runner, "bs", None),
-+            )
- 
-         if self.eplb_manager is not None:
-             self.eplb_manager.on_forward_pass_end()
-
-@@ -1186,8 +1186,25 @@ class ModelRunner:
+@@ -1186,14 +1186,30 @@ class ModelRunner:
              for handle in handles:
                  handle.wait()
  
@@ -1472,8 +1441,7 @@ index 4d58278b7..8f50dc430 100644
              )
              logger.error(error_msg)
              return False, error_msg
-
-@@ -1218,7 +1235,24 @@ class ModelRunner:
+@@ -1218,12 +1235,28 @@ class ModelRunner:
              )
              reconstructed_tensors = bucket.reconstruct_tensors()
              self.model.load_weights(reconstructed_tensors)
@@ -1503,6 +1471,36 @@ index 4d58278b7..8f50dc430 100644
              )
              logger.error(error_msg)
              return False, error_msg
+@@ -2645,9 +2692,12 @@ class ModelRunner:
+     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
+         self.forward_pass_id += 1
+ 
+-        with get_global_expert_distribution_recorder().with_forward_pass(
+-            self.forward_pass_id,
+-            forward_batch,
++        with (
++            get_global_expert_distribution_recorder().with_forward_pass(
++                self.forward_pass_id,
++                forward_batch,
++            ),
++            get_global_experts_capturer().with_forward(forward_batch),
+         ):
+             output = self._forward_raw(
+                 forward_batch,
+@@ -2656,6 +2706,13 @@ class ModelRunner:
+                 reinit_attn_backend,
+                 split_forward_count,
+             )
++            # Copy cached routing experts' buffers back to CPU cache
++            get_global_experts_capturer().sync_fwd_experts_buffer_DtoH(
++                device_loc=forward_batch.out_cache_loc,
++                cpu_loc=forward_batch.out_cache_loc_cpu,
++                can_run_graph=output[1],
++                cuda_graph_batch=getattr(self.graph_runner, "bs", None),
++            )
+ 
+         if self.eplb_manager is not None:
+             self.eplb_manager.on_forward_pass_end()
 diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
 index dc30b4f0a..f29dc4b71 100644
 --- a/python/sglang/srt/models/deepseek_v2.py
@@ -2314,3 +2312,26 @@ index 4c5134ac3..178093d9d 100644
      def _handle_update_weights_from_disk_req_output(self, recv_obj):
          if self.server_args.dp_size == 1:
              self.model_update_result.set_result(recv_obj)
+
+diff --git a/python/sglang/srt/managers/data_parallel_controller.py b/python/sglang/srt/managers/data_parallel_controller.py
+index ec9ae1d3d..0fc905eaa 100644
+--- a/python/sglang/srt/managers/data_parallel_controller.py
++++ b/python/sglang/srt/managers/data_parallel_controller.py
+@@ -164,7 +164,8 @@ class DataParallelController:
+ 
+         if server_args.enable_dp_attention:
+             self.launch_dp_attention_schedulers(server_args, port_args)
+-            self.control_message_step = server_args.tp_size
++            # One worker socket per DP rank; send control messages to all DP ranks.
++            self.control_message_step = 1
+         else:
+             self.launch_dp_schedulers(server_args, port_args)
+             self.control_message_step = 1
+@@ -176,6 +177,6 @@ class DataParallelController:
+             worker.send_pyobj(obj)
+ 
+     def send_control_message(self, obj):
+-        # Send control messages to first worker of tp group
++        # Send control messages to each DP worker.
+         for worker in self.workers[:: self.control_message_step]:
+             worker.send_pyobj(obj)
