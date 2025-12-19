@@ -2075,7 +2075,7 @@ index b3d72df05..ddfe0b178 100644
          else:
              # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
              self.topk_p = self.topk_p[new_indices]
-@@ -777,6 +781,27 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
+@@ -777,7 +781,28 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
          self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
          self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
          self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
@@ -2103,7 +2103,7 @@ index b3d72df05..ddfe0b178 100644
  
  
  @dataclass
-
+ 
 diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
 index e71bfce48..eae0ead86 100644
 --- a/python/sglang/srt/managers/io_struct.py
@@ -2163,19 +2163,12 @@ index db884c4a2..f3488cd9f 100644
                  if self.chunked_req is not None:
                      chunked_req_to_exclude.add(self.chunked_req)
              self.last_batch.filter_batch(
-@@ -2534,6 +2535,34 @@ class Scheduler(
+@@ -2534,6 +2535,27 @@ class Scheduler(
              self.running_batch.batch_is_full = False
              self.chunked_req = None
  
 +        if recv_req.mode == "in_place_safe":
 +            try:
-+                # Ensure there are no in-flight kernels on this rank.
-+                if self.device not in (None, "cpu"):
-+                    device_module = torch.get_device_module(self.device)
-+                    synchronize = getattr(device_module, "synchronize", None)
-+                    if synchronize is not None:
-+                        synchronize()
-+
 +                # Ensure all ranks reach the safe point before acknowledging.
 +                if (
 +                    torch.distributed.is_initialized()
@@ -2202,37 +2195,8 @@ diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt
 index 4c5134ac3..178093d9d 100644
 --- a/python/sglang/srt/managers/tokenizer_manager.py
 +++ b/python/sglang/srt/managers/tokenizer_manager.py
-@@ -62,6 +62,7 @@ from sglang.srt.managers.io_struct import (
-     LoadLoRAAdapterReqInput,
-     OpenSessionReqOutput,
-     PauseGenerationReqInput,
-+    PauseGenerationReqOutput,
-     SessionParams,
-     TokenizedEmbeddingReqInput,
-     TokenizedGenerateReqInput,
-@@ -325,6 +326,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
-         self.model_update_result: Optional[Awaitable[UpdateWeightFromDiskReqOutput]] = (
-             None
-         )
-+
-+        # Pause safe-point acks
-+        self._pause_safe_future: Optional[asyncio.Future] = None
-+        self._pause_safe_expected: int = 0
-+        self._pause_safe_seen: int = 0
-+        self._pause_safe_results: List[PauseGenerationReqOutput] = []
-+
-         self.is_pause = False
-         self.is_pause_cond = asyncio.Condition()
  
-@@ -392,6 +400,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
-                 ),
-                 (AbortReq, self._handle_abort_req),
-                 (OpenSessionReqOutput, self._handle_open_session_req_output),
-+                (PauseGenerationReqOutput, self._handle_pause_generation_req_output),
-                 (
-                     UpdateWeightFromDiskReqOutput,
-                     self._handle_update_weights_from_disk_req_output,
-@@ -1172,19 +1181,41 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
+@@ -1172,9 +1181,35 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
              )
  
      async def pause_generation(self, obj: PauseGenerationReqInput):
@@ -2254,65 +2218,21 @@ index 4c5134ac3..178093d9d 100644
 +            return
 +
 +        if obj.mode == "in_place_safe":
-+            if self._pause_safe_future is not None and not self._pause_safe_future.done():
-+                raise RuntimeError("pause_generation(in_place_safe) already in progress")
++            results = await self.pause_generation_communicator(obj)
 +
-+            self._pause_safe_future = asyncio.Future()
-+            self._pause_safe_expected = self.server_args.dp_size
-+            self._pause_safe_seen = 0
-+            self._pause_safe_results = []
-+            try:
-                 await self.send_to_scheduler.send_pyobj(obj)
--            else:
--                # we are using the model_update_lock to check if there is still on-going requests.
--                while True:
--                    # TODO: maybe make it async instead of fire-and-forget
--                    self.abort_request(abort_all=True)
--                    is_locked = await self.model_update_lock.is_locked()
--                    if not is_locked:
--                        break
--                    await asyncio.sleep(1.0)
-+                await asyncio.wait_for(self._pause_safe_future, timeout=10)
-+            finally:
-+                self._pause_safe_future = None
-+                self._pause_safe_expected = 0
-+                self._pause_safe_seen = 0
-+                self._pause_safe_results = []
++            all_success = all([r.success for r in results])
++            all_message = " | ".join([r.message for r in results])
++            if not all_success:
++                logger.error(f"Some schedulers failed to pause safely: {all_message}")
++                raise RuntimeError(f"Pause failed: {all_message}")
++
++            logger.info(f"All {len(results)} schedulers paused safely")
 +            return
 +
 +        await self.send_to_scheduler.send_pyobj(obj)
  
      async def continue_generation(self, obj: ContinueGenerationReqInput):
          async with self.is_pause_cond:
-@@ -1984,6 +2015,27 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
-             recv_obj.session_id if recv_obj.success else None
-         )
- 
-+    def _handle_pause_generation_req_output(self, recv_obj: PauseGenerationReqOutput):
-+        if self._pause_safe_future is None:
-+            return
-+
-+        self._pause_safe_results.append(recv_obj)
-+        self._pause_safe_seen += 1
-+
-+        if self._pause_safe_seen < self._pause_safe_expected:
-+            return
-+
-+        if self._pause_safe_future.done():
-+            return
-+
-+        all_success = all(r.success for r in self._pause_safe_results)
-+        if all_success:
-+            self._pause_safe_future.set_result(self._pause_safe_results)
-+        else:
-+            messages = [r.message for r in self._pause_safe_results if r.message]
-+            msg = " | ".join(messages) if messages else "unknown error"
-+            self._pause_safe_future.set_exception(RuntimeError(msg))
-+
-     def _handle_update_weights_from_disk_req_output(self, recv_obj):
-         if self.server_args.dp_size == 1:
-             self.model_update_result.set_result(recv_obj)
-
 diff --git a/python/sglang/srt/managers/data_parallel_controller.py b/python/sglang/srt/managers/data_parallel_controller.py
 index ec9ae1d3d..0fc905eaa 100644
 --- a/python/sglang/srt/managers/data_parallel_controller.py
@@ -2327,7 +2247,7 @@ index ec9ae1d3d..0fc905eaa 100644
          else:
              self.launch_dp_schedulers(server_args, port_args)
              self.control_message_step = 1
-@@ -176,6 +177,6 @@ class DataParallelController:
+@@ -176,7 +177,7 @@ class DataParallelController:
              worker.send_pyobj(obj)
  
      def send_control_message(self, obj):
@@ -2335,3 +2255,37 @@ index ec9ae1d3d..0fc905eaa 100644
 +        # Send control messages to each DP worker.
          for worker in self.workers[:: self.control_message_step]:
              worker.send_pyobj(obj)
+ 
+diff --git a/python/sglang/srt/managers/tokenizer_communicator_mixin.py b/python/sglang/srt/managers/tokenizer_communicator_mixin.py
+index 000000000..000000000 100644
+--- a/python/sglang/srt/managers/tokenizer_communicator_mixin.py
++++ b/python/sglang/srt/managers/tokenizer_communicator_mixin.py
+@@ -48,6 +48,7 @@ from sglang.srt.managers.io_struct import (
+     LoadLoRAAdapterReqOutput,
+     LoRAUpdateOutput,
+     OpenSessionReqInput,
++    PauseGenerationReqOutput,
+     ProfileReq,
+     ProfileReqOutput,
+     ProfileReqType,
+@@ -157,5 +158,8 @@ class TokenizerCommunicatorMixin:
+     def init_communicators(self: TokenizerManager, server_args: ServerArgs):
+         # Communicators
++        self.pause_generation_communicator = _Communicator(
++            self.send_to_scheduler, server_args.dp_size
++        )
+         self.init_weights_update_group_communicator = _Communicator(
+             self.send_to_scheduler, server_args.dp_size
+         )
+@@ -222,7 +226,11 @@ class TokenizerCommunicatorMixin:
+     def _get_communicator_dispatcher(self: TokenizerManager):
+         return TypeBasedDispatcher(
+             [
++                (
++                    PauseGenerationReqOutput,
++                    self.pause_generation_communicator.handle_recv,
++                ),
+                 (
+                     InitWeightsUpdateGroupReqOutput,
+                     self.init_weights_update_group_communicator.handle_recv,
+                 ),
