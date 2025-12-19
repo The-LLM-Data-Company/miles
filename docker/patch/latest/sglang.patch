@@ -2075,7 +2075,7 @@ index b3d72df05..ddfe0b178 100644
          else:
              # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
              self.topk_p = self.topk_p[new_indices]
-@@ -777,7 +781,28 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
+@@ -777,6 +781,27 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
          self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
          self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
          self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
