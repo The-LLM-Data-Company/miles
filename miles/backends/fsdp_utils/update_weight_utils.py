@@ -1,6 +1,7 @@
 import abc
 import logging
 import socket
+from datetime import timedelta
 from argparse import Namespace
 from collections.abc import Sequence
 
@@ -27,6 +28,27 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+
+_PIPELINE_RL_UPDATE_GROUP_TIMEOUT_S = 120
+
+
+def _raise_if_any_engine_failed(results: list[dict], *, weight_version: int) -> None:
+    """Fail-closed if any rollout engine reports update failure."""
+    failures = []
+    for i, r in enumerate(results):
+        try:
+            success = bool(r.get("success", True))
+            message = str(r.get("message", ""))
+        except Exception:
+            success = False
+            message = f"unparseable result: {r!r}"
+        if not success:
+            failures.append((i, message))
+    if failures:
+        msg = " | ".join([f"engine[{i}]={m}" for i, m in failures])
+        raise RuntimeError(
+            f"PipelineRL weight update failed: weight_version={weight_version}. {msg}"
+        )
 
 
 class UpdateWeight(abc.ABC):
@@ -192,21 +214,29 @@ class UpdateWeightFromDistributed(UpdateWeight):
             ray.get([engine.pause_generation.remote(mode="in_place_safe") for engine in self.rollout_engines])
 
         dist.barrier()
-        self._do_update_weights()
+        err: Exception | None = None
+        try:
+            self._do_update_weights()
+        except Exception as e:
+            err = e
+
+        # Prevent deadlocks: make all ranks observe failure and exit instead of
+        # hanging at the post-update barrier.
+        err_flag = torch.tensor([1 if err is not None else 0], device=torch.cuda.current_device())
+        dist.all_reduce(err_flag, op=dist.ReduceOp.MAX)
         dist.barrier()
+
+        if err_flag.item() != 0:
+            if err is not None:
+                raise err
+            raise RuntimeError(
+                f"PipelineRL weight update failed on another rank (weight_version={self.weight_version}); "
+                "see logs on rank 0."
+            )
 
         if dist.get_rank() == 0 and getattr(self.args, "pipeline_rl", False):
-            self._verify_weight_versions(expected_version=self.weight_version)
             ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
         dist.barrier()
-
-    def _verify_weight_versions(self, expected_version: int) -> None:
-        expected = str(expected_version)
-        versions = ray.get([engine.get_weight_version.remote() for engine in self.rollout_engines])
-        normalized = [str(v) for v in versions if v is not None]
-        mismatched = [v for v in normalized if v != expected]
-        if mismatched:
-            raise RuntimeError(f"PipelineRL engine weight_version mismatch: expected={expected}, got={normalized}")
 
     def connect_rollout_engines(
         self,
@@ -247,6 +277,10 @@ class UpdateWeightFromDistributed(UpdateWeight):
                 world_size=world_size,
                 rank=0,
                 group_name=self._group_name,
+                # Fail fast instead of hanging forever if some rank never enters the collective.
+                timeout=timedelta(seconds=_PIPELINE_RL_UPDATE_GROUP_TIMEOUT_S)
+                if getattr(self.args, "pipeline_rl", False)
+                else None,
             )
             ray.get(refs)
 
@@ -266,21 +300,29 @@ class UpdateWeightFromDistributed(UpdateWeight):
                 named_tensors_by_dtype.setdefault(tensor.dtype, []).append((name, tensor))
 
             for _, dtype_named_tensors in named_tensors_by_dtype.items():
-                refs = [
-                    engine.update_weights_from_distributed.remote(
-                        names=[name for name, _ in dtype_named_tensors],
-                        dtypes=[param.dtype for _, param in dtype_named_tensors],
-                        shapes=[param.shape for _, param in dtype_named_tensors],
-                        group_name=self._group_name,
-                        weight_version=str(self.weight_version),
-                        load_format="flattened_bucket",
+                try:
+                    refs = [
+                        engine.update_weights_from_distributed.remote(
+                            names=[name for name, _ in dtype_named_tensors],
+                            dtypes=[param.dtype for _, param in dtype_named_tensors],
+                            shapes=[param.shape for _, param in dtype_named_tensors],
+                            group_name=self._group_name,
+                            weight_version=str(self.weight_version),
+                            load_format="flattened_bucket",
+                        )
+                        for engine in self.rollout_engines
+                    ]
+                    bucket = FlattenedTensorBucket(named_tensors=dtype_named_tensors)
+                    flattened_tensor = bucket.get_flattened_tensor()
+                    dist.broadcast(flattened_tensor, 0, group=self._model_update_groups)
+                    results = ray.get(refs)
+                    _raise_if_any_engine_failed(results, weight_version=self.weight_version)
+                except Exception as e:
+                    # Fail closed: if update fails or hangs, do not silently continue.
+                    logger.exception(
+                        f"PipelineRL update_weights_from_distributed failed (weight_version={self.weight_version})"
                     )
-                    for engine in self.rollout_engines
-                ]
-                bucket = FlattenedTensorBucket(named_tensors=dtype_named_tensors)
-                flattened_tensor = bucket.get_flattened_tensor()
-                dist.broadcast(flattened_tensor, 0, group=self._model_update_groups)
-                ray.get(refs)
+                    raise e
         else:
             refs = [
                 engine.update_weights_from_distributed.remote(

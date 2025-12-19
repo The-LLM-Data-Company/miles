@@ -1439,6 +1439,70 @@ index 4d58278b7..8f50dc430 100644
  
          if self.eplb_manager is not None:
              self.eplb_manager.on_forward_pass_end()
+
+@@ -1186,8 +1186,25 @@ class ModelRunner:
+             for handle in handles:
+                 handle.wait()
+ 
+             self.model.load_weights(weights)
+-            return True, "Succeeded to update parameter online."
++            # Ensure all TP ranks finished applying weights before reporting success.
++            if self.server_args.elastic_ep_backend == "mooncake":
++                # Mooncake does not support `monitored_barrier`
++                dist.barrier(group=get_tp_group().cpu_group)
++            else:
++                # Handle the case where some ranks do not finish loading.
++                try:
++                    dist.monitored_barrier(
++                        group=get_tp_group().cpu_group,
++                        timeout=datetime.timedelta(seconds=120),
++                        wait_all_ranks=True,
++                    )
++                except RuntimeError:
++                    raise ValueError(
++                        f"TP rank {self.tp_rank} could finish the weight update, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
++                    ) from None
++            return True, "Succeeded to update parameter online."
+ 
+         except Exception as e:
+             error_msg = (
+                 f"Failed to update parameter online: {e}. "
+                 f"The full weights of the ModelRunner are partially updated. "
+                 f"Please discard the whole weights."
+             )
+             logger.error(error_msg)
+             return False, error_msg
+
+@@ -1218,7 +1235,24 @@ class ModelRunner:
+             )
+             reconstructed_tensors = bucket.reconstruct_tensors()
+             self.model.load_weights(reconstructed_tensors)
+-            return True, f"Succeeded to update parameter online."
++            # Ensure all TP ranks finished applying weights before reporting success.
++            if self.server_args.elastic_ep_backend == "mooncake":
++                # Mooncake does not support `monitored_barrier`
++                dist.barrier(group=get_tp_group().cpu_group)
++            else:
++                # Handle the case where some ranks do not finish loading.
++                try:
++                    dist.monitored_barrier(
++                        group=get_tp_group().cpu_group,
++                        timeout=datetime.timedelta(seconds=120),
++                        wait_all_ranks=True,
++                    )
++                except RuntimeError:
++                    raise ValueError(
++                        f"TP rank {self.tp_rank} could finish the weight update, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
++                    ) from None
++            return True, f"Succeeded to update parameter online."
+         except Exception as e:
+             error_msg = (
+                 f"Failed to update parameter online: {e}. "
+                 f"The full weights of the ModelRunner are partially updated. "
+                 f"Please discard the whole weights."
+             )
+             logger.error(error_msg)
+             return False, error_msg
 diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
 index dc30b4f0a..f29dc4b71 100644
 --- a/python/sglang/srt/models/deepseek_v2.py

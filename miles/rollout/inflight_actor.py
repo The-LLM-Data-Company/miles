@@ -1,6 +1,7 @@
 import asyncio
 import queue
 import threading
+import time
 from argparse import Namespace
 from collections.abc import Callable
 
@@ -51,6 +52,15 @@ class InflightRolloutGenerator:
 
         self._dropped_by_filter = 0
 
+        # --- Metrics (best-effort; used for monitoring producer/consumer dynamics) ---
+        self._metrics_lock = threading.Lock()
+        self._queue_full_events_since_last = 0
+        self._queue_full_events_total = 0
+        self._queue_empty_get_events_since_last = 0
+        self._queue_empty_get_events_total = 0
+        self._queue_empty_get_wait_s_since_last = 0.0
+        self._queue_empty_get_wait_s_total = 0.0
+
     def start(self) -> None:
         if self._started:
             return
@@ -80,8 +90,41 @@ class InflightRolloutGenerator:
     def get_next_groups(self, num_groups: int) -> list[list[Sample]]:
         groups = []
         for _ in range(num_groups):
-            groups.append(self._queue.get())
+            # Best-effort signal for "trainer stalls because queue is empty"
+            waited_s = None
+            if self._queue.empty():
+                t0 = time.time()
+                with self._metrics_lock:
+                    self._queue_empty_get_events_since_last += 1
+                    self._queue_empty_get_events_total += 1
+                group = self._queue.get()
+                waited_s = time.time() - t0
+            else:
+                group = self._queue.get()
+
+            if waited_s is not None:
+                with self._metrics_lock:
+                    self._queue_empty_get_wait_s_since_last += waited_s
+                    self._queue_empty_get_wait_s_total += waited_s
+            groups.append(group)
         return groups
+
+    def pop_metrics_snapshot(self) -> dict[str, float]:
+        """Return a metrics snapshot and reset 'since_last' counters.
+
+        Designed to be called by the rollout consumer once per rollout step.
+        """
+        with self._metrics_lock:
+            out = {
+                "queue_size": float(self._queue.qsize()),
+                "queue_full_events": float(self._queue_full_events_since_last),
+                "queue_empty_get_events": float(self._queue_empty_get_events_since_last),
+                "queue_empty_get_wait_s": float(self._queue_empty_get_wait_s_since_last),
+            }
+            self._queue_full_events_since_last = 0
+            self._queue_empty_get_events_since_last = 0
+            self._queue_empty_get_wait_s_since_last = 0.0
+            return out
 
     async def _run_loop(self) -> None:
         state = GenerateState(self.args)
@@ -134,6 +177,9 @@ class InflightRolloutGenerator:
                         self._queue.put_nowait(group)
                         break
                     except queue.Full:
+                        with self._metrics_lock:
+                            self._queue_full_events_since_last += 1
+                            self._queue_full_events_total += 1
                         await asyncio.sleep(0.01)
 
         for task in pendings:

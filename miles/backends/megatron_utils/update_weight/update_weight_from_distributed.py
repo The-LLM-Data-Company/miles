@@ -1,5 +1,6 @@
 import socket
 import time
+from datetime import timedelta
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
 
@@ -20,6 +21,27 @@ try:
     from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket  # type: ignore[import]
 except ImportError:
     from sglang.srt.model_executor.model_runner import FlattenedTensorBucket  # type: ignore[import]
+
+_PIPELINE_RL_UPDATE_GROUP_TIMEOUT_S = 120
+
+
+def _raise_if_any_engine_failed(results: list[dict], *, weight_version: int) -> None:
+    """Fail-closed if any rollout engine reports update failure."""
+    failures = []
+    for i, r in enumerate(results):
+        try:
+            success = bool(r.get("success", True))
+            message = str(r.get("message", ""))
+        except Exception:
+            success = False
+            message = f"unparseable result: {r!r}"
+        if not success:
+            failures.append((i, message))
+    if failures:
+        msg = " | ".join([f"engine[{i}]={m}" for i, m in failures])
+        raise RuntimeError(
+            f"PipelineRL weight update failed: weight_version={weight_version}. {msg}"
+        )
 
 
 class UpdateWeightFromDistributed:
@@ -121,20 +143,9 @@ class UpdateWeightFromDistributed:
 
         dist.barrier(group=get_gloo_group())
 
-        if dist.get_rank() == 0 and getattr(self.args, "pipeline_rl", False):
-            self._verify_weight_versions(expected_version=self.weight_version)
-
         if dist.get_rank() == 0:
             ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
-
-    def _verify_weight_versions(self, expected_version: int) -> None:
-        expected = str(expected_version)
-        versions = ray.get([engine.get_weight_version.remote() for engine in self.rollout_engines])
-        normalized = [str(v) for v in versions if v is not None]
-        mismatched = [v for v in normalized if v != expected]
-        if mismatched:
-            raise RuntimeError(f"PipelineRL engine weight_version mismatch: expected={expected}, got={normalized}")
 
     def _update_weight_from_distributed(
         self,
@@ -241,7 +252,9 @@ class UpdateWeightFromDistributed:
             load_format="flattened_bucket" if getattr(self.args, "pipeline_rl", False) else None,
         )
 
-        ray.get(refs)
+        results = ray.get(refs)
+        if getattr(self.args, "pipeline_rl", False):
+            _raise_if_any_engine_failed(results, weight_version=self.weight_version)
         converted_named_tensors.clear()
         ray.get(self.rollout_engine_lock.release.remote())
         pbar.update(1)
@@ -276,6 +289,9 @@ def connect_rollout_engines_from_distributed(
         world_size=world_size,
         rank=0,
         group_name=group_name,
+        timeout=timedelta(seconds=_PIPELINE_RL_UPDATE_GROUP_TIMEOUT_S)
+        if getattr(args, "pipeline_rl", False)
+        else None,
     )
     ray.get(refs)
     return model_update_groups

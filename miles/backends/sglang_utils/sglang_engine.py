@@ -270,14 +270,6 @@ class SGLangEngine(RayActor):
             response.raise_for_status()
         kill_process_tree(self.process.pid)
 
-    def get_weight_version(self):
-        if self.node_rank != 0:
-            return
-        url = f"http://{self.server_host}:{self.server_port}/get_weight_version"
-        response = requests.get(url)
-        response.raise_for_status()
-        return response.json()["weight_version"]
-
     def release_memory_occupation(self):
         self.flush_cache()
         return self._make_request("release_memory_occupation")

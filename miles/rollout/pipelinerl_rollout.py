@@ -55,6 +55,7 @@ def generate_rollout(
 
     inflight = _get_global_inflight(args, data_buffer)
     groups = inflight.get_next_groups(args.rollout_batch_size)
+    inflight_metrics = inflight.pop_metrics_snapshot()
 
     # Flatten and deterministically order samples (matches the previous RolloutManager
     # PipelineRL branch behavior).
@@ -71,7 +72,18 @@ def generate_rollout(
     except Exception:
         pass
 
-    return RolloutFnTrainOutput(samples=samples)
+    metrics = {
+        # Queue size (consumer-side view): should be roughly stable; if it's often 0,
+        # the trainer is stalling waiting for new samples.
+        "rollout/pipeline_rl/queue_size": inflight_metrics["queue_size"],
+        # Count of times the producer hit a full queue and had to back off.
+        "rollout/pipeline_rl/queue_full_events": inflight_metrics["queue_full_events"],
+        # Count of times the consumer observed an empty queue and blocked.
+        "rollout/pipeline_rl/queue_empty_get_events": inflight_metrics["queue_empty_get_events"],
+        # Total wall time spent blocked on an empty queue since last rollout step.
+        "rollout/pipeline_rl/queue_empty_get_wait_s": inflight_metrics["queue_empty_get_wait_s"],
+    }
+    return RolloutFnTrainOutput(samples=samples, metrics=metrics)
 
 
 # Ensure cleanup on process exit (mirrors `examples/fully_async/fully_async_rollout.py`).

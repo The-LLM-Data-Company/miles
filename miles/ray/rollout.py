@@ -136,8 +136,17 @@ class RolloutManager:
     def check_weights(self, action: str):
         return ray.get([engine.check_weights.remote(action=action) for engine in self.rollout_engines])
 
-    def get_rollout_weight_versions(self):
-        return ray.get([engine.get_weight_version.remote() for engine in self.rollout_engines])
+    def set_published_weight_version(self, weight_version: str | int | None) -> None:
+        """Set the trainer-published weight version inside the rollout process.
+
+        This enables PipelineRL to stamp a "version-at-submit" (w_first).
+        """
+        try:
+            from miles.rollout.sglang_rollout import set_published_weight_version
+
+            set_published_weight_version(weight_version)
+        except Exception as e:
+            logger.warning(f"Failed to set published weight_version={weight_version}: {e}")
 
     def _get_rollout_data(self, rollout_id):
         if self.args.load_debug_rollout_data:

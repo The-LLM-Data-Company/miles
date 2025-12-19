@@ -481,11 +481,14 @@ class FSDPTrainRayActor(TrainRayActor):
         with inverse_timer("train_wait"), timer("train"):
             rollout_data = process_rollout_data(self.args, rollout_data_ref, self.dp_rank, self.dp_size)
 
-            if getattr(self.args, "pipeline_rl", False) and "weight_version_last" in rollout_data:
-                last_versions_raw = rollout_data["weight_version_last"]
+            if getattr(self.args, "pipeline_rl", False) and (
+                "weight_version_first" in rollout_data or "weight_version_last" in rollout_data
+            ):
+                # Core PipelineRL semantics: prefer "version at submit" (w_first) if available.
+                versions_raw = rollout_data.get("weight_version_first") or rollout_data.get("weight_version_last")
                 current_version = self.weight_updater.weight_version
                 last_versions = []
-                for v in last_versions_raw:
+                for v in versions_raw:
                     if v is None:
                         last_versions.append(current_version)
                         continue
@@ -499,12 +502,15 @@ class FSDPTrainRayActor(TrainRayActor):
 
                 max_lag = getattr(self.args, "pipeline_max_weight_lag", None)
                 if max_lag is not None:
-                    keep_idx = [i for i, lag in enumerate(lags) if lag <= max_lag]
-                    if len(keep_idx) < len(lags):
-                        num_samples = len(lags)
-                        for key, val in list(rollout_data.items()):
-                            if isinstance(val, list) and len(val) == num_samples:
-                                rollout_data[key] = [val[i] for i in keep_idx]
+                    num_samples = len(lags)
+                    loss_masks = rollout_data.get("loss_masks")
+                    if isinstance(loss_masks, list) and len(loss_masks) == num_samples:
+                        for i, lag in enumerate(lags):
+                            if lag > max_lag:
+                                mask = loss_masks[i]
+                                if isinstance(mask, list):
+                                    loss_masks[i] = [0] * len(mask)
+                        rollout_data["loss_masks"] = loss_masks
             if self.args.debug_rollout_only:
                 return
             self._train_core(rollout_id=rollout_id, rollout_data=rollout_data)
@@ -522,6 +528,21 @@ class FSDPTrainRayActor(TrainRayActor):
             raw_reward_list = rollout_data["raw_reward"]
             if raw_reward_list:
                 log_dict["rollout/raw_reward"] = sum(raw_reward_list) / len(raw_reward_list)
+
+        # PipelineRL staleness metrics: how often weight_lag exceeds the configured threshold.
+        if getattr(self.args, "pipeline_rl", False) and "weight_lag" in rollout_data:
+            max_lag = getattr(self.args, "pipeline_max_weight_lag", None)
+            lags = rollout_data.get("weight_lag")
+            if max_lag is not None and isinstance(lags, list) and len(lags) > 0:
+                local_exceeds = sum(1 for lag in lags if isinstance(lag, int) and lag > max_lag)
+                exceeds_t = torch.tensor(local_exceeds, device=torch.cuda.current_device(), dtype=torch.long)
+                dist.all_reduce(exceeds_t, op=dist.ReduceOp.SUM, group=self.dp_group)
+                global_exceeds = int(exceeds_t.item())
+                total_samples = self.args.n_samples_per_prompt * self.args.rollout_batch_size
+                log_dict["rollout/pipeline_rl/lag_exceeds_max_count"] = global_exceeds
+                log_dict["rollout/pipeline_rl/lag_exceeds_max_frac"] = (
+                    global_exceeds / total_samples if total_samples > 0 else 0.0
+                )
 
         for metric_key in ["log_probs", "rollout_log_probs", "ref_log_probs", "advantages", "returns"]:
             if metric_key not in packed_batches[0]:
@@ -815,6 +836,15 @@ class FSDPTrainRayActor(TrainRayActor):
             dist.barrier(group=get_gloo_group())
 
         self.weight_updater.update_weights()
+        if dist.get_rank() == 0 and getattr(self.args, "pipeline_rl", False):
+            # Publish the last broadcasted version to the rollout process so it can
+            # stamp a "version-at-submit" (w_first).
+            try:
+                ray.get(
+                    self.rollout_manager.set_published_weight_version.remote(self.weight_updater.weight_version)
+                )
+            except Exception as e:
+                logger.warning(f"Failed to publish weight_version to rollout manager: {e}")
         clear_memory()
 
     def _create_ref_model(self, ref_load_path: str | None):

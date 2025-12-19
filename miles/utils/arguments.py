@@ -827,7 +827,10 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 "--pipeline-max-weight-lag",
                 type=int,
                 default=4,
-                help="Max allowed weight_version lag between trainer and samples; staler samples are dropped.",
+                help=(
+                    "Max allowed weight_version lag between trainer and samples; staler samples are ignored for "
+                    "gradient (loss mask set to 0) to preserve fixed batch/group structure."
+                ),
             )
             parser.add_argument(
                 "--use-routing-replay",

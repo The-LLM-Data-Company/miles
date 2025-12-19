@@ -34,6 +34,18 @@ __all__ = ["generate_rollout"]
 logger = logging.getLogger(__name__)
 
 
+_published_weight_version: str | None = None
+
+
+def set_published_weight_version(version: str | int | None) -> None:
+    global _published_weight_version
+    _published_weight_version = None if version is None else str(version)
+
+
+def get_published_weight_version() -> str | None:
+    return _published_weight_version
+
+
 class GenerateState(metaclass=SingletonMeta):
     """
     The global state for the generation process.
@@ -85,6 +97,38 @@ class GenerateState(metaclass=SingletonMeta):
                 )
             )
         self.remaining_batch_size += len(samples)
+
+async def _get_rollout_engine_weight_version(args: Namespace) -> str | None:
+    """Return current rollout engine weight_version, or None if unavailable."""
+    # Prefer the trainer-published version in PipelineRL mode
+    if getattr(args, "pipeline_rl", False):
+        if (v := get_published_weight_version()) is not None:
+            return v
+
+    # Prefer querying the router directly. In a healthy system, all rollout workers
+    # share the same `weight_version`, so we don't need to enumerate worker URLs.
+    base = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
+    for endpoint in ("/weight_version", "/get_weight_version", "/model_info", "/get_model_info"):
+        try:
+            out = await get(f"{base}{endpoint}")
+            v = out.get("weight_version")
+            if v is not None:
+                return v
+        except Exception:
+            continue
+    return None
+
+
+def _append_weight_version(obj: Any, version: str) -> None:
+    """Append version to Sample.weight_versions, handling nested list structures."""
+    if isinstance(obj, list):
+        for item in obj:
+            _append_weight_version(item, version)
+        return
+    try:
+        obj.weight_versions.append(version)
+    except Exception:
+        return
 
 
 async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, Any]) -> Sample:
@@ -271,6 +315,14 @@ async def generate_and_rm_group(
 
     if state.aborted:
         return group
+
+    # PipelineRL core: stamp "version at submit" (w_first) before firing /generate.
+    # This makes weight_version_first meaningful even without partial rollouts.
+    if getattr(args, "pipeline_rl", False) and not evaluation:
+        w_first = await _get_rollout_engine_weight_version(args)
+        if w_first is not None:
+            for s in group:
+                _append_weight_version(s, w_first)
 
     tasks = []
     for idx, sample in enumerate(group):
