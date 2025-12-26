@@ -338,6 +338,17 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "This should be useful if you need to implement some special rollout logic, e.g. multi-turn, function calling."
                 ),
             )
+            parser.add_argument(
+                "--token-io-mode",
+                type=str,
+                choices=["token_out", "retokenize"],
+                default="retokenize",
+                help=(
+                    "Token I/O policy for rollout generation. "
+                    "'token_out': require engine token IDs (output_ids or output_token_logprobs), error if missing or mismatched. "
+                    "'retokenize': legacy behavior (token in, text out, then retokenize)."
+                ),
+            )
 
             parser.add_argument(
                 "--buffer-filter-path",
