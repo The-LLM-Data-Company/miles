@@ -184,6 +184,39 @@ class MegatronTrainRayActor(TrainRayActor):
             mpu.get_data_parallel_rank(with_context_parallel=False),
             mpu.get_data_parallel_world_size(with_context_parallel=False),
         )
+
+        if (
+            getattr(self.args, "pipeline_rl", False)
+            and hasattr(self, "weight_updater")
+            and ("weight_version_first" in rollout_data or "weight_version_last" in rollout_data)
+        ):
+            # Core PipelineRL semantics: prefer "version at submit" (w_first) if available.
+            versions_raw = rollout_data.get("weight_version_first") or rollout_data.get("weight_version_last")
+            current_version = self.weight_updater.weight_version
+            last_versions = []
+            for v in versions_raw:
+                if v is None:
+                    last_versions.append(current_version)
+                    continue
+                try:
+                    last_versions.append(int(v))
+                except (TypeError, ValueError):
+                    last_versions.append(current_version)
+
+            lags = [current_version - v for v in last_versions]
+            rollout_data["weight_lag"] = lags
+
+            max_lag = getattr(self.args, "pipeline_max_weight_lag", None)
+            if max_lag is not None:
+                num_samples = len(lags)
+                loss_masks = rollout_data.get("loss_masks")
+                if isinstance(loss_masks, list) and len(loss_masks) == num_samples:
+                    for i, lag in enumerate(lags):
+                        if lag > max_lag:
+                            mask = loss_masks[i]
+                            if isinstance(mask, list):
+                                loss_masks[i] = [0] * len(mask)
+                    rollout_data["loss_masks"] = loss_masks
         # TODO: this is ugly, move to somewhere else?
         # move tokens to GPU in advance
         rollout_data["tokens"] = [
@@ -492,6 +525,16 @@ class MegatronTrainRayActor(TrainRayActor):
             print_memory("before update_weights")
             self.weight_updater.update_weights()
             print_memory("after update_weights")
+
+            if dist.get_rank() == 0 and getattr(self.args, "pipeline_rl", False):
+                # Publish the last broadcasted version to the rollout process so it can
+                # stamp a "version-at-submit" (w_first).
+                try:
+                    ray.get(
+                        self.rollout_manager.set_published_weight_version.remote(self.weight_updater.weight_version)
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to publish weight_version to rollout manager: {e}")
 
             if getattr(self.args, "keep_old_actor", False):
                 if self.args.update_weights_interval == 1:

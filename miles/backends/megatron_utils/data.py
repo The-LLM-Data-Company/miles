@@ -322,6 +322,17 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
         total_lengths = rollout_data["total_lengths"]
         max_seq_lens = rollout_data.get("max_seq_lens", None)
 
+        # PipelineRL staleness metrics: how often weight_lag exceeds the configured threshold.
+        if getattr(args, "pipeline_rl", False) and "weight_lag" in rollout_data:
+            max_lag = getattr(args, "pipeline_max_weight_lag", None)
+            lags = rollout_data.get("weight_lag")
+            if max_lag is not None and isinstance(lags, list) and len(lags) > 0:
+                dp_size = mpu.get_data_parallel_world_size(with_context_parallel=True)
+                local_exceeds = sum(1 for lag in lags if isinstance(lag, int) and lag > max_lag)
+                # Scale by dp_size so the DP-mean reduction yields a global count.
+                log_dict["pipeline_rl/lag_exceeds_max_count"] = float(local_exceeds * dp_size)
+                log_dict["pipeline_rl/lag_exceeds_max_frac"] = float(local_exceeds / len(lags))
+
         for key, val in rollout_data.items():
             if key in [
                 "tokens",

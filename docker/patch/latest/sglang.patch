@@ -1419,6 +1419,68 @@ index 4d58278b7..8f50dc430 100644
          ):
              self.model = get_model(
                  model_config=self.model_config,
+@@ -1186,6 +1186,22 @@ class ModelRunner:
+             for handle in handles:
+                 handle.wait()
+ 
+             self.model.load_weights(weights)
+-            return True, "Succeeded to update parameter online."
++            # Ensure all TP ranks finished applying weights before reporting success.
++            if self.server_args.elastic_ep_backend == "mooncake":
++                # Mooncake does not support `monitored_barrier`
++                dist.barrier(group=get_tp_group().cpu_group)
++            else:
++                # Handle the case where some ranks do not finish loading.
++                try:
++                    dist.monitored_barrier(
++                        group=get_tp_group().cpu_group,
++                        timeout=datetime.timedelta(seconds=120),
++                        wait_all_ranks=True,
++                    )
++                except RuntimeError:
++                    raise ValueError(
++                        f"TP rank {self.tp_rank} could finish the weight update, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
++                    ) from None
++            return True, "Succeeded to update parameter online."
+ 
+         except Exception as e:
+             error_msg = (
+                 f"Failed to update parameter online: {e}. "
+                 f"The full weights of the ModelRunner are partially updated. "
+                 f"Please discard the whole weights."
+             )
+             logger.error(error_msg)
+             return False, error_msg
+@@ -1218,6 +1234,22 @@ class ModelRunner:
+             )
+             reconstructed_tensors = bucket.reconstruct_tensors()
+             self.model.load_weights(reconstructed_tensors)
+-            return True, f"Succeeded to update parameter online."
++            # Ensure all TP ranks finished applying weights before reporting success.
++            if self.server_args.elastic_ep_backend == "mooncake":
++                # Mooncake does not support `monitored_barrier`
++                dist.barrier(group=get_tp_group().cpu_group)
++            else:
++                # Handle the case where some ranks do not finish loading.
++                try:
++                    dist.monitored_barrier(
++                        group=get_tp_group().cpu_group,
++                        timeout=datetime.timedelta(seconds=120),
++                        wait_all_ranks=True,
++                    )
++                except RuntimeError:
++                    raise ValueError(
++                        f"TP rank {self.tp_rank} could finish the weight update, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
++                    ) from None
++            return True, f"Succeeded to update parameter online."
+         except Exception as e:
+             error_msg = (
+                 f"Failed to update parameter online: {e}. "
+                 f"The full weights of the ModelRunner are partially updated. "
+                 f"Please discard the whole weights."
+             )
+             logger.error(error_msg)
+             return False, error_msg
 @@ -2645,9 +2692,12 @@ class ModelRunner:
      ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
          self.forward_pass_id += 1
@@ -2051,3 +2113,189 @@ index b3d72df05..ddfe0b178 100644
  
  
  @dataclass
+ 
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index e71bfce48..eae0ead86 100644
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -1113,18 +1113,31 @@ class PauseGenerationReqInput(BaseReq):
+             requests will be retracted back to the waiting_queue.
+             Note: The KV cache can be flushed in this mode and will be automatically
+             recomputed after continue_generation.
++
++    in_place_safe: Like in_place (pause scheduling without draining), but blocks
++            until the scheduler reaches a safe point (no in-flight forwards)
++            before returning.
+     """
+ 
+-    mode: Literal["abort", "retract", "in_place"] = "abort"
++    mode: Literal["abort", "retract", "in_place", "in_place_safe"] = "abort"
+ 
+     def __post_init__(self):
+-        allowed = ["abort", "retract", "in_place"]
++        allowed = ["abort", "retract", "in_place", "in_place_safe"]
+         if self.mode not in allowed:
+             raise ValueError(
+                 f"Invalid mode: {self.mode!r}. " f"Expected one of {allowed}."
+             )
+ 
+ 
++@dataclass
++class PauseGenerationReqOutput(BaseReq):
++    """Internal scheduler->tokenizer ack for PauseGenerationReqInput."""
++
++    success: bool
++    mode: str
++    message: str = ""
++
++
+ @dataclass
+ class ContinueGenerationReqInput(BaseReq):
+     pass
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 075f26df3..340141983 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -96,6 +96,7 @@ from sglang.srt.managers.io_struct import (
+     OpenSessionReqInput,
+     OpenSessionReqOutput,
+     PauseGenerationReqInput,
++    PauseGenerationReqOutput,
+     ProfileReq,
+     ReleaseMemoryOccupationReqInput,
+     ResumeMemoryOccupationReqInput,
+@@ -2497,7 +2498,7 @@ class Scheduler(
+ 
+         if self.last_batch and self.last_batch.forward_mode.is_extend():
+             chunked_req_to_exclude = set()
+-            if recv_req.mode == "in_place":
++            if recv_req.mode in ("in_place", "in_place_safe"):
+                 if self.chunked_req is not None:
+                     chunked_req_to_exclude.add(self.chunked_req)
+             self.last_batch.filter_batch(
+@@ -2518,6 +2519,27 @@ class Scheduler(
+             self.running_batch.batch_is_full = False
+             self.chunked_req = None
+ 
++        if recv_req.mode == "in_place_safe":
++            try:
++                # Ensure all ranks reach the safe point before acknowledging.
++                if (
++                    torch.distributed.is_initialized()
++                    and self.cpu_group is not None
++                    and torch.distributed.get_world_size(group=self.cpu_group) > 1
++                ):
++                    barrier(group=self.cpu_group)
++
++                return PauseGenerationReqOutput(
++                    success=True, mode=recv_req.mode, message="paused_safe"
++                )
++            except Exception as e:
++                logger.exception("pause_generation(in_place_safe) failed")
++                return PauseGenerationReqOutput(
++                    success=False, mode=recv_req.mode, message=str(e)
++                )
++
++        return None
++
+     def continue_generation(self, recv_req: ContinueGenerationReqInput):
+         self._engine_paused = False
+ 
+diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+index 4c5134ac3..7c6e8e3a4 100644
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -1172,19 +1172,35 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
+             )
+ 
+     async def pause_generation(self, obj: PauseGenerationReqInput):
++        self.auto_create_handle_loop()
++
+         async with self.is_pause_cond:
+             self.is_pause = True
+-            if obj.mode != "abort":
++
++        if obj.mode == "abort":
++            # We are using the model_update_lock to check if there are still ongoing requests.
++            while True:
++                # TODO: maybe make it async instead of fire-and-forget
++                self.abort_request(abort_all=True)
++                is_locked = await self.model_update_lock.is_locked()
++                if not is_locked:
++                    break
++                await asyncio.sleep(1.0)
++            return
++
++        if obj.mode == "in_place_safe":
++            results = await self.pause_generation_communicator(obj)
++
++            all_success = all([r.success for r in results])
++            all_message = " | ".join([r.message for r in results])
++            if not all_success:
++                logger.error(f"Some schedulers failed to pause safely: {all_message}")
++                raise RuntimeError(f"Pause failed: {all_message}")
++
++            logger.info(f"All {len(results)} schedulers paused safely")
++            return
++
++        await self.send_to_scheduler.send_pyobj(obj)
+ 
+     async def continue_generation(self, obj: ContinueGenerationReqInput):
+         async with self.is_pause_cond:
+diff --git a/python/sglang/srt/managers/data_parallel_controller.py b/python/sglang/srt/managers/data_parallel_controller.py
+index ec9ae1d3d..0fc905eaa 100644
+--- a/python/sglang/srt/managers/data_parallel_controller.py
++++ b/python/sglang/srt/managers/data_parallel_controller.py
+@@ -164,7 +164,8 @@ class DataParallelController:
+ 
+         if server_args.enable_dp_attention:
+             self.launch_dp_attention_schedulers(server_args, port_args)
+-            self.control_message_step = server_args.tp_size
++            # One worker socket per DP rank; send control messages to all DP ranks.
++            self.control_message_step = 1
+         else:
+             self.launch_dp_schedulers(server_args, port_args)
+             self.control_message_step = 1
+@@ -176,7 +177,7 @@ class DataParallelController:
+             worker.send_pyobj(obj)
+ 
+     def send_control_message(self, obj):
+-        # Send control messages to first worker of tp group
++        # Send control messages to each DP worker.
+         for worker in self.workers[:: self.control_message_step]:
+             worker.send_pyobj(obj)
+ 
+diff --git a/python/sglang/srt/managers/tokenizer_communicator_mixin.py b/python/sglang/srt/managers/tokenizer_communicator_mixin.py
+index a5626f0b7..c8a55f72c 100644
+--- a/python/sglang/srt/managers/tokenizer_communicator_mixin.py
++++ b/python/sglang/srt/managers/tokenizer_communicator_mixin.py
+@@ -49,6 +49,7 @@ from sglang.srt.managers.io_struct import (
+     LoadLoRAAdapterReqOutput,
+     LoRAUpdateOutput,
+     OpenSessionReqInput,
++    PauseGenerationReqOutput,
+     ProfileReq,
+     ProfileReqOutput,
+     ProfileReqType,
+@@ -156,6 +157,9 @@ class TokenizerCommunicatorMixin:
+ 
+     def init_communicators(self: TokenizerManager, server_args: ServerArgs):
+         # Communicators
++        self.pause_generation_communicator = _Communicator(
++            self.send_to_scheduler, server_args.dp_size
++        )
+         self.init_weights_update_group_communicator = _Communicator(
+             self.send_to_scheduler, server_args.dp_size
+         )
+@@ -222,6 +226,10 @@ class TokenizerCommunicatorMixin:
+     def _get_communicator_dispatcher(self: TokenizerManager):
+         return TypeBasedDispatcher(
+             [
++                (
++                    PauseGenerationReqOutput,
++                    self.pause_generation_communicator.handle_recv,
++                ),
+                 (
+                     InitWeightsUpdateGroupReqOutput,
+                     self.init_weights_update_group_communicator.handle_recv,
+                 ),

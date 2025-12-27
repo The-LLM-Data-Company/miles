@@ -136,6 +136,18 @@ class RolloutManager:
     def check_weights(self, action: str):
         return ray.get([engine.check_weights.remote(action=action) for engine in self.rollout_engines])
 
+    def set_published_weight_version(self, weight_version: str | int | None) -> None:
+        """Set the trainer-published weight version inside the rollout process.
+
+        This enables PipelineRL to stamp a "version-at-submit" (w_first).
+        """
+        try:
+            from miles.rollout.sglang_rollout import set_published_weight_version
+
+            set_published_weight_version(weight_version)
+        except Exception as e:
+            logger.warning(f"Failed to set published weight_version={weight_version}: {e}")
+
     def _get_rollout_data(self, rollout_id):
         if self.args.load_debug_rollout_data:
             data = torch.load(
@@ -234,6 +246,14 @@ class RolloutManager:
             "sample_indices": [sample.index for sample in samples],
         }
 
+        train_data["weight_version_last"] = [
+            sample.weight_versions[-1] if sample.weight_versions else None for sample in samples
+        ]
+        train_data["weight_version_first"] = [
+            sample.weight_versions[0] if sample.weight_versions else None for sample in samples
+        ]
+
+
         # loss mask
         # TODO: compress the loss mask
         loss_masks = []
@@ -311,6 +331,8 @@ class RolloutManager:
                 "sample_indices",
                 "rollout_log_probs",
                 "rollout_routed_experts",
+                "weight_version_first",
+                "weight_version_last",
                 "prompt",
                 "teacher_log_probs",
             ]:
