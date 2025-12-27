@@ -87,10 +87,17 @@ class GenerateState(metaclass=SingletonMeta):
         self.remaining_batch_size += len(samples)
 
 
-async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, Any]) -> Sample:
+async def generate(
+    args: Namespace,
+    sample: Sample,
+    sampling_params: dict[str, Any],
+    base_url: str | None = None,
+) -> Sample:
     """Generate using traditional SGLang router with token-based workflow"""
     state = GenerateState(args)
-    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+    if base_url is None:
+        base_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
+    url = f"{base_url}/generate"
 
     assert (
         sample.status == Sample.Status.PENDING or sample.status == Sample.Status.ABORTED
@@ -204,6 +211,7 @@ async def generate_and_rm(
     sample: Sample | list[Sample],
     sampling_params: dict[str, Any],
     evaluation: bool = False,
+    base_url: str | None = None,
 ) -> Sample | list[Sample]:
     # For samples with existing response, check if they're complete
     if sample.status == Sample.Status.COMPLETED or sample.status == Sample.Status.TRUNCATED:
@@ -224,7 +232,7 @@ async def generate_and_rm(
             custom_generate_func = load_function(args.custom_generate_function_path)
             sample = await custom_generate_func(args, sample, sampling_params)
         else:
-            sample = await generate(args, sample, sampling_params)
+            sample = await generate(args, sample, sampling_params, base_url=base_url)
 
     # for the rm that need the whole group, we will not do the rm here
     if args.group_rm:
@@ -253,7 +261,11 @@ async def generate_and_rm(
 
 
 async def generate_and_rm_group(
-    args: Namespace, group: list[Sample], sampling_params: dict[str, Any], evaluation: bool = False
+    args: Namespace,
+    group: list[Sample],
+    sampling_params: dict[str, Any],
+    evaluation: bool = False,
+    base_url: str | None = None,
 ) -> list[Sample]:
     state = GenerateState(args)
 
@@ -266,7 +278,7 @@ async def generate_and_rm_group(
         if getattr(args, "sglang_enable_deterministic_inference", False):
             seed = state.group_sampling_seeds[idx]
             current_sampling_params["sampling_seed"] = seed
-        tasks.append(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation))
+        tasks.append(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation, base_url=base_url))
 
     group = await asyncio.gather(*tasks)
 
