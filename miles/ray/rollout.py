@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import multiprocessing
 import os
@@ -14,6 +15,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from miles.backends.sglang_utils.sglang_engine import SGLangEngine
 from miles.rollout.base_types import call_rollout_fn
+from miles.rollout.streaming_rollout_manager import StreamingRolloutManager
 from miles.utils import tracking_utils
 from miles.utils.health_monitor import RolloutHealthMonitor
 from miles.utils.http_utils import _wrap_ipv6, find_available_port, get_host_info, init_http_client
@@ -23,6 +25,7 @@ from miles.utils.metric_checker import MetricChecker
 from miles.utils.metric_utils import compute_pass_rate, compute_rollout_step, compute_statistics, dict_add_prefix
 from miles.utils.misc import load_function
 from miles.utils.ray_utils import Box
+from miles.utils.reward_normalization import group_normalize_rewards
 from miles.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from miles.utils.tracking_utils import init_tracking
 from miles.utils.types import Sample
@@ -36,7 +39,7 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
-@ray.remote
+@ray.remote(max_concurrency=1)
 class RolloutManager:
     """The class to run rollout and convert rollout data to training data."""
 
@@ -75,6 +78,10 @@ class RolloutManager:
         if self.args.use_fault_tolerance:
             self._health_monitor = RolloutHealthMonitor(self, args)
 
+        self._streaming: StreamingRolloutManager | None = None
+        self._trainer_version: int = 0
+        self._streaming_rollout_id: int | None = None
+
     def dispose(self):
         if self._metric_checker is not None:
             self._metric_checker.dispose()
@@ -107,6 +114,130 @@ class RolloutManager:
                 self.num_new_engines = init_rollout_engines(self.args, self.pg, self.all_rollout_engines)
             else:
                 self.num_new_engines = 0
+
+    async def start_streaming(self, start_rollout_id: int):
+        if self.args.debug_train_only or self.args.debug_rollout_only:
+            raise RuntimeError("--streaming-async is not supported in debug-only modes")
+
+        if self._streaming is not None:
+            return self._streaming.engine_pool.rolling_updates_enabled
+
+        num_engines = len(self.rollout_engines)
+        if num_engines == 0:
+            raise RuntimeError("No rollout engines available for --streaming-async")
+
+        engine_urls = ray.get([engine.get_http_base_url.remote() for engine in self.rollout_engines])
+
+        groups_per_train_step = self.args.rollout_batch_size
+        queue_target = 2 * groups_per_train_step
+        queue_cap = min(4 * groups_per_train_step, num_engines * 16)
+        inflight_target = min(3 * groups_per_train_step, num_engines * 8)
+        min_active_engines = max(num_engines - 1, 1)
+
+        rolling_updates_enabled = num_engines >= 2
+        if not rolling_updates_enabled:
+            logger.warning(
+                "Only one rollout engine detected; rolling weight updates are disabled and will fall back to global update."
+            )
+
+        self._trainer_version = 0
+        self._streaming_rollout_id = start_rollout_id
+
+        self._streaming = StreamingRolloutManager(
+            self.args,
+            self.data_source,
+            engine_urls=engine_urls,
+            groups_per_train_step=groups_per_train_step,
+            queue_target=queue_target,
+            queue_cap=queue_cap,
+            inflight_target=inflight_target,
+            min_active_engines=min_active_engines,
+            rolling_updates_enabled=rolling_updates_enabled,
+        )
+        self._streaming.start()
+
+        return rolling_updates_enabled
+
+    async def stop_streaming(self):
+        if self._streaming is None:
+            return
+        await self._streaming.stop()
+        self._streaming = None
+
+    async def get_next_train_batch(self) -> list[Box]:
+        if self._streaming is None:
+            raise RuntimeError("Streaming is not started")
+        if self._streaming_rollout_id is None:
+            raise RuntimeError("Streaming rollout id is not initialized")
+
+        rollout_id = self._streaming_rollout_id
+
+        groups, extra = await self._streaming.get_next_groups(
+            num_groups=self.args.rollout_batch_size,
+            target_version=self._trainer_version,
+            max_staleness_versions=self.args.max_staleness_versions,
+        )
+
+        samples: list[Sample] = []
+        for g in groups:
+            samples.extend(g.group)
+
+        data = self._convert_samples_to_train_data(samples)
+        refs = self._split_train_data_by_dp(data, self.train_parallel_config["dp_size"])
+
+        staleness_values = extra.get("staleness_values") or []
+        ages_s = extra.get("queue_ages_s") or []
+        stats = self._streaming.stats()
+
+        log_dict: dict[str, Any] = {
+            "rollout/stream/queue_size_groups": stats["queue_size_groups"],
+            "rollout/stream/inflight_groups": stats["inflight_groups"],
+            "rollout/stream/groups_produced_per_s": stats["groups_produced_per_s"],
+            "rollout/stream/groups_consumed_per_s": stats["groups_consumed_per_s"],
+            "rollout/stream/empty_wait_s": extra.get("empty_wait_s", 0.0),
+            "rollout/stream/stale_groups_dropped": stats["stale_groups_dropped"],
+        }
+
+        engine_pool = stats.get("engine_pool") or {}
+        log_dict["rollout/stream/drain_only_engines"] = engine_pool.get("num_drain_only", 0)
+        log_dict["rollout/stream/active_engines"] = engine_pool.get("num_active", 0)
+
+        for v, count in (engine_pool.get("versions") or {}).items():
+            log_dict[f"rollout/stream/engine_versions/v{v}"] = count
+
+        if staleness_values:
+            for s, items in group_by(staleness_values).items():
+                log_dict[f"rollout/stream/staleness_versions_hist/v{s}"] = len(items)
+
+        if ages_s:
+            log_dict["rollout/stream/queue_age_s_p50"] = float(np.percentile(ages_s, 50))
+            log_dict["rollout/stream/queue_age_s_p95"] = float(np.percentile(ages_s, 95))
+
+        step = compute_rollout_step(self.args, rollout_id)
+        log_dict["rollout/step"] = step
+        tracking_utils.log(self.args, log_dict, step_key="rollout/step")
+
+        self._streaming_rollout_id += 1
+
+        return refs
+
+    async def notify_new_version(self, version: int):
+        self._trainer_version = version
+        if self._streaming is not None:
+            self._streaming.engine_pool.notify_new_version(version)
+            if not self._streaming.engine_pool.rolling_updates_enabled:
+                for e in self._streaming.engine_pool.engines:
+                    e.drain_only = True
+
+    async def get_update_candidates(self) -> list[int]:
+        if self._streaming is None:
+            return []
+        return self._streaming.engine_pool.get_update_candidates()
+
+    async def mark_engines_updated(self, engine_indices: list[int], version: int):
+        if self._streaming is None:
+            return
+        self._streaming.engine_pool.mark_engines_updated(engine_indices, version)
 
     def eval(self, rollout_id):
         if self.args.debug_train_only:
@@ -191,26 +322,22 @@ class RolloutManager:
         if self.custom_reward_post_process_func is not None:
             return self.custom_reward_post_process_func(self.args, samples)
 
+        if samples and isinstance(samples[0], list):
+            samples = sum(samples, [])
+
         raw_rewards = [sample.get_reward_value(self.args) for sample in samples]
         if (
             self.args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline"]
             and self.args.rewards_normalization
         ):
             # group norm
-            rewards = torch.tensor(raw_rewards, dtype=torch.float)
-            if rewards.shape[-1] == self.args.n_samples_per_prompt * self.args.rollout_batch_size:
-                rewards = rewards.reshape(-1, self.args.n_samples_per_prompt)
-            else:
-                # when samples count are not equal in each group
-                rewards = rewards.view(-1, rewards.shape[-1])
-            mean = rewards.mean(dim=-1, keepdim=True)
-            rewards = rewards - mean
-
-            if self.args.advantage_estimator in ["grpo", "gspo"] and self.args.grpo_std_normalization:
-                std = rewards.std(dim=-1, keepdim=True)
-                rewards = rewards / (std + 1e-6)
-
-            return raw_rewards, rewards.flatten().tolist()
+            normalized_rewards = group_normalize_rewards(
+                samples=samples,
+                raw_rewards=raw_rewards,
+                advantage_estimator=self.args.advantage_estimator,
+                grpo_std_normalization=self.args.grpo_std_normalization,
+            )
+            return raw_rewards, normalized_rewards
 
         return raw_rewards, raw_rewards
 

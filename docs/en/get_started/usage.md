@@ -179,6 +179,12 @@ Additionally, we provide a `metadata_key`, which defaults to `"metadata"`. When 
 - `--calculate-per-token-loss`: By default, Miles calculates loss on a per-sample basis, i.e., `mean(sum(sample_i) / len(sample_i))`. Enable this flag to calculate loss on a per-token basis, i.e., `sum(sum(sample_i)) / sum(len(sample_i))`.
 - `--use-tis`: Enable this setting to use TIS (Truncated Importance Sampling) (https://fengyao.notion.site/off-policy-rl).
 
+### Streaming Async (Experimental)
+
+- `--streaming-async`: Enable streaming rollout generation (group-as-atom) and rolling weight updates to SGLang engines.
+- `--max-staleness-versions`: Drop rollout groups that are more than this many policy versions stale (default: 1).
+- `--use-tis` is recommended in streaming mode to tolerate mildly off-policy data.
+
 ## Custom Rollout Function
 
 miles supports customizing data generation (rollout) to various degrees.

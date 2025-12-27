@@ -132,6 +132,18 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="Whether to enable true-on-policy mode.",
             )
             parser.add_argument(
+                "--streaming-async",
+                action="store_true",
+                default=False,
+                help="Enable streaming async rollouts with rolling weight updates.",
+            )
+            parser.add_argument(
+                "--max-staleness-versions",
+                type=int,
+                default=1,
+                help="Drop rollout groups older than this many policy versions in streaming async mode.",
+            )
+            parser.add_argument(
                 "--train-env-vars",
                 type=json.loads,
                 default="{}",
@@ -1425,6 +1437,25 @@ def miles_validate_args(args):
 
     if args.use_rollout_logprobs:
         assert not args.use_tis, "use_rollout_logprobs and use_tis cannot be set at the same time."
+
+    if getattr(args, "streaming_async", False):
+        if args.max_staleness_versions < 0:
+            raise ValueError("--max-staleness-versions must be >= 0")
+
+        if args.balance_data and args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline"]:
+            raise ValueError(
+                "--streaming-async group-as-atom requires not splitting prompt groups across DP partitions; "
+                "disable --balance-data for this advantage estimator."
+            )
+
+        if args.prefill_num_servers is not None:
+            raise ValueError("--streaming-async does not support prefill-decode disaggregation (--prefill-num-servers)")
+
+        if getattr(args, "use_miles_router", False):
+            raise ValueError("--streaming-async does not support MilesRouter")
+
+        if not args.use_tis:
+            logger.warning("--streaming-async is enabled; consider adding --use-tis for off-policy tolerance.")
 
     if args.get_mismatch_metrics:
         assert (

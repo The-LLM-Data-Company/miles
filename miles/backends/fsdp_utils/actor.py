@@ -29,7 +29,12 @@ from ...utils.profile_utils import TrainProfiler
 from . import checkpoint
 from .data_packing import pack_sequences, pad_packed_sequence_with_cp, unpack_sequences
 from .lr_scheduler import get_lr_scheduler
-from .update_weight_utils import UpdateWeightFromDistributed, UpdateWeightFromTensor
+from .update_weight_utils import (
+    UpdateWeightFromDistributed,
+    UpdateWeightFromTensor,
+    connect_rollout_engines_subset_from_distributed,
+    destroy_rollout_engines_subset_group,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -772,6 +777,64 @@ class FSDPTrainRayActor(TrainRayActor):
                 log_dict["train/step"] = self.global_step
                 tracking_utils.log(self.args, log_dict, step_key="train/step")
             self.global_step += 1
+
+    @timer
+    def update_rollout_engines(self, engine_indices: list[int], version: int | None = None) -> None:  # type: ignore[override]
+        if self.args.debug_train_only or self.args.debug_rollout_only:
+            return
+
+        if not engine_indices:
+            return
+
+        rollout_engines, rollout_engine_lock, _num_new_engines = ray.get(
+            self.rollout_manager.get_rollout_engines_and_lock.remote()
+        )
+        subset = [rollout_engines[i] for i in engine_indices]
+
+        if self.args.colocate:
+            self.weight_updater.connect_rollout_engines(subset, rollout_engine_lock)
+            self.weight_updater.update_weights()
+            clear_memory()
+            return
+
+        group_name = f"miles-subset-{version or 0}-{engine_indices[0]}-{os.getpid()}-{self.global_step}"
+
+        prev_rollout_engines = getattr(self.weight_updater, "rollout_engines", None)
+        prev_rollout_engine_lock = getattr(self.weight_updater, "rollout_engine_lock", None)
+        prev_group_name = getattr(self.weight_updater, "_group_name", None)
+        prev_model_update_groups = getattr(self.weight_updater, "_model_update_groups", None)
+        prev_weight_version = getattr(self.weight_updater, "weight_version", None)
+        prev_is_src_rank = getattr(self.weight_updater, "_is_src_rank", None)
+
+        model_update_group = None
+        try:
+            self.weight_updater.rollout_engines = subset
+            self.weight_updater.rollout_engine_lock = rollout_engine_lock
+            self.weight_updater._group_name = group_name
+            self.weight_updater._model_update_groups = None
+            self.weight_updater._is_src_rank = dist.get_rank() == 0
+            self.weight_updater.weight_version = str(version) if version is not None else None
+
+            if dist.get_rank() == 0:
+                model_update_group = connect_rollout_engines_subset_from_distributed(self.args, subset, group_name)
+                self.weight_updater._model_update_groups = model_update_group
+
+            self.weight_updater.update_weights()
+        finally:
+            if dist.get_rank() == 0:
+                try:
+                    destroy_rollout_engines_subset_group(subset, group_name, model_update_group)
+                except Exception:
+                    logger.exception(f"Failed to destroy subset weight update group: {group_name}")
+
+            self.weight_updater.rollout_engines = prev_rollout_engines
+            self.weight_updater.rollout_engine_lock = prev_rollout_engine_lock
+            self.weight_updater._group_name = prev_group_name
+            self.weight_updater._model_update_groups = prev_model_update_groups
+            self.weight_updater.weight_version = prev_weight_version
+            self.weight_updater._is_src_rank = prev_is_src_rank
+
+        clear_memory()
 
     @timer
     def update_weights(self) -> None:  # type: ignore[override]

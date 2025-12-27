@@ -29,39 +29,81 @@ def train(args):
         ray.get(rollout_manager.check_weights.remote(action="compare"))
 
     # async train loop.
-    rollout_data_next_future = rollout_manager.generate.remote(args.start_rollout_id)
-    for rollout_id in range(args.start_rollout_id, args.num_rollout):
-        # Sync the last generation
-        if rollout_data_next_future is not None:
-            rollout_data_curr_ref = ray.get(rollout_data_next_future)
+    if args.streaming_async:
+        rolling_updates_enabled = ray.get(rollout_manager.start_streaming.remote(args.start_rollout_id))
+        policy_version = 0
 
-        # Start the next rollout early.
-        if rollout_id + 1 < args.num_rollout:
-            rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
+        for rollout_id in range(args.start_rollout_id, args.num_rollout):
+            rollout_data_curr_ref = ray.get(rollout_manager.get_next_train_batch.remote())
 
-        if args.use_critic:
-            critic_train_handle = critic_model.async_train(rollout_id, rollout_data_curr_ref)
-            if rollout_id >= args.num_critic_only_steps:
-                ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
-            ray.get(critic_train_handle)
-        else:
-            ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
-
-        if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch):
-            actor_model.save_model(rollout_id)
             if args.use_critic:
-                critic_model.save_model(rollout_id)
-            if args.rollout_global_dataset:
-                ray.get(rollout_manager.save.remote(rollout_id))
+                critic_train_handle = critic_model.async_train(rollout_id, rollout_data_curr_ref)
+                if rollout_id >= args.num_critic_only_steps:
+                    ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
+                ray.get(critic_train_handle)
+            else:
+                ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
 
-        if (rollout_id + 1) % args.update_weights_interval == 0:
-            # sync generate before update weights to prevent update weight in the middle of generation
-            rollout_data_curr_ref = ray.get(x) if (x := rollout_data_next_future) is not None else None
-            rollout_data_next_future = None
-            actor_model.update_weights()
+            if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch):
+                actor_model.save_model(rollout_id)
+                if args.use_critic:
+                    critic_model.save_model(rollout_id)
+                if args.rollout_global_dataset:
+                    ray.get(rollout_manager.save.remote(rollout_id))
 
-        if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
-            ray.get(rollout_manager.eval.remote(rollout_id))
+            if (rollout_id + 1) % args.update_weights_interval == 0:
+                policy_version += 1
+                ray.get(rollout_manager.notify_new_version.remote(policy_version))
+
+                if not rolling_updates_enabled:
+                    actor_model.update_weights()
+                    ray.get(rollout_manager.mark_engines_updated.remote([0], policy_version))
+
+            if rolling_updates_enabled:
+                engine_ids = ray.get(rollout_manager.get_update_candidates.remote())
+                if engine_ids:
+                    actor_model.update_rollout_engines(engine_ids, version=policy_version)
+                    ray.get(rollout_manager.mark_engines_updated.remote(engine_ids, policy_version))
+
+            if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
+                ray.get(rollout_manager.eval.remote(rollout_id))
+
+        ray.get(rollout_manager.stop_streaming.remote())
+    else:
+        # async train loop.
+        rollout_data_next_future = rollout_manager.generate.remote(args.start_rollout_id)
+        for rollout_id in range(args.start_rollout_id, args.num_rollout):
+            # Sync the last generation
+            if rollout_data_next_future is not None:
+                rollout_data_curr_ref = ray.get(rollout_data_next_future)
+
+            # Start the next rollout early.
+            if rollout_id + 1 < args.num_rollout:
+                rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
+
+            if args.use_critic:
+                critic_train_handle = critic_model.async_train(rollout_id, rollout_data_curr_ref)
+                if rollout_id >= args.num_critic_only_steps:
+                    ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
+                ray.get(critic_train_handle)
+            else:
+                ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
+
+            if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch):
+                actor_model.save_model(rollout_id)
+                if args.use_critic:
+                    critic_model.save_model(rollout_id)
+                if args.rollout_global_dataset:
+                    ray.get(rollout_manager.save.remote(rollout_id))
+
+            if (rollout_id + 1) % args.update_weights_interval == 0:
+                # sync generate before update weights to prevent update weight in the middle of generation
+                rollout_data_curr_ref = ray.get(x) if (x := rollout_data_next_future) is not None else None
+                rollout_data_next_future = None
+                actor_model.update_weights()
+
+            if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
+                ray.get(rollout_manager.eval.remote(rollout_id))
 
     ray.get(rollout_manager.dispose.remote())
 
