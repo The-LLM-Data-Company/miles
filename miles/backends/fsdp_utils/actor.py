@@ -794,6 +794,7 @@ class FSDPTrainRayActor(TrainRayActor):
         if self.args.colocate:
             self.weight_updater.connect_rollout_engines(subset, rollout_engine_lock)
             self.weight_updater.update_weights()
+            dist.barrier(group=get_gloo_group())
             clear_memory()
             return
 
@@ -833,6 +834,8 @@ class FSDPTrainRayActor(TrainRayActor):
             self.weight_updater._model_update_groups = prev_model_update_groups
             self.weight_updater.weight_version = prev_weight_version
             self.weight_updater._is_src_rank = prev_is_src_rank
+
+            dist.barrier(group=get_gloo_group())
 
         clear_memory()
 

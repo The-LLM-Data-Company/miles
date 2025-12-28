@@ -268,7 +268,7 @@ def connect_rollout_engines_subset_from_distributed(args: Namespace, rollout_eng
     """
     master_address = ray._private.services.get_node_ip_address()
     with socket.socket() as sock:
-        sock.bind(("", 0))
+        sock.bind((master_address, 0))
         master_port = sock.getsockname()[1]
 
     world_size = len(rollout_engines) * args.rollout_num_gpus_per_engine + 1
