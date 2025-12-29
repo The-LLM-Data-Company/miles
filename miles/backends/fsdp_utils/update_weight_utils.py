@@ -218,7 +218,6 @@ class UpdateWeightFromDistributed(UpdateWeight):
                 world_size=world_size,
                 rank=0,
                 group_name=self._group_name,
-                weight_version=self.weight_version,
             )
             ray.get(refs)
 
