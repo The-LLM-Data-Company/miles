@@ -88,9 +88,15 @@ class GenerateState(metaclass=SingletonMeta):
 
 
 async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, Any]) -> Sample:
-    """Generate using traditional SGLang router with token-based workflow"""
+    """Generate using SGLang with configurable token I/O mode.
+
+    Token I/O mode (--token-io-mode):
+      - 'token_out': require engine token IDs (output_ids or output_token_logprobs), error if missing/mismatched
+      - 'retokenize': legacy behavior (token in, text out, then retokenize via retrieve_from_text)
+    """
     state = GenerateState(args)
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+    token_io_mode = getattr(args, "token_io_mode", "retokenize")
 
     assert (
         sample.status == Sample.Status.PENDING or sample.status == Sample.Status.ABORTED
@@ -144,28 +150,41 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
 
     output = await post(url, payload)
 
-    # Extract new response tokens
+    # Extract new response tokens based on token_io_mode
+    if token_io_mode == "token_out":
+        # Token-out mode: require engine token IDs, never retokenize
+        output_ids = output.get("output_ids")
+        output_token_logprobs = (output.get("meta_info") or {}).get("output_token_logprobs")
 
-    if args.use_miles_router and "RadixTreeMiddleware" in args.miles_router_middleware_paths:
-        assert not args.partial_rollout, "Currently parital rollout is not suppurted when using miles router"
-        retrieve_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/retrieve_from_text"
-        retrieve_payload = {"text": sample.prompt + output["text"], "return_logp": True}
-        retrieve_output = await post(retrieve_url, retrieve_payload)
-        sample.tokens = retrieve_output["tokens"]
-        sample.response += output["text"]
-        sample.loss_mask = retrieve_output["loss_mask"]
-        sample.response_length = get_response_lengths([sample.loss_mask])[0]
-        sample.loss_mask = sample.loss_mask[-sample.response_length :]
-        sample.rollout_log_probs = retrieve_output["rollout_logp"][-sample.response_length :]
-        # Notice: currently cannot get the spec info from radix router output.
-    else:
-        if "output_token_logprobs" in output["meta_info"]:
-            new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
-            new_response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
+        # Determine token source
+        if output_ids is not None:
+            new_response_tokens = list(output_ids)
+        elif output_token_logprobs is not None:
+            new_response_tokens = [item[1] for item in output_token_logprobs]
         else:
-            new_response_tokens, new_response_log_probs = [], []
+            raise RuntimeError(
+                "token_out mode requires engine token IDs (output_ids or output_token_logprobs). "
+                "Check SGLang version or use --token-io-mode retokenize."
+            )
 
-        # Update sample with tokens directly - avoiding re-tokenization
+        # Validate: if both present, they must match
+        if output_ids is not None and output_token_logprobs is not None:
+            tokens_from_logprobs = [item[1] for item in output_token_logprobs]
+            if tokens_from_logprobs != list(output_ids):
+                raise RuntimeError(
+                    "token_out mode: mismatch between output_ids and output_token_logprobs. "
+                    "Refusing to proceed (would violate token identity)."
+                )
+
+        # Require logprobs for PPO/GRPO old-logprob tracking
+        if output_token_logprobs is not None:
+            new_response_log_probs = [item[0] for item in output_token_logprobs]
+        else:
+            raise RuntimeError(
+                "token_out mode requires output_token_logprobs for PPO/GRPO old-logprob tracking."
+            )
+
+        # Update sample with tokens directly
         sample.tokens = sample.tokens + new_response_tokens
         sample.response_length += len(new_response_tokens)
         sample.response += output["text"]
@@ -175,11 +194,47 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         sample.rollout_log_probs += new_response_log_probs
 
         if args.sglang_speculative_algorithm:
-            # cannot directly use spec info from sglang because of partial rollout.
             sample.spec_info.add(
                 meta_info=output["meta_info"],
                 response_length=sample.response_length,
             )
+
+    else:  # token_io_mode == "retokenize"
+        # Retokenize mode: legacy behavior
+        if args.use_miles_router and "RadixTreeMiddleware" in args.miles_router_middleware_paths:
+            assert not args.partial_rollout, "Currently parital rollout is not suppurted when using miles router"
+            retrieve_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/retrieve_from_text"
+            retrieve_payload = {"text": sample.prompt + output["text"], "return_logp": True}
+            retrieve_output = await post(retrieve_url, retrieve_payload)
+            sample.tokens = retrieve_output["tokens"]
+            sample.response += output["text"]
+            sample.loss_mask = retrieve_output["loss_mask"]
+            sample.response_length = get_response_lengths([sample.loss_mask])[0]
+            sample.loss_mask = sample.loss_mask[-sample.response_length :]
+            sample.rollout_log_probs = retrieve_output["rollout_logp"][-sample.response_length :]
+            # Notice: currently cannot get the spec info from radix router output.
+        else:
+            if "output_token_logprobs" in output["meta_info"]:
+                new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
+                new_response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
+            else:
+                new_response_tokens, new_response_log_probs = [], []
+
+            # Update sample with tokens directly - avoiding re-tokenization
+            sample.tokens = sample.tokens + new_response_tokens
+            sample.response_length += len(new_response_tokens)
+            sample.response += output["text"]
+
+            if sample.rollout_log_probs is None:
+                sample.rollout_log_probs = []
+            sample.rollout_log_probs += new_response_log_probs
+
+            if args.sglang_speculative_algorithm:
+                # cannot directly use spec info from sglang because of partial rollout.
+                sample.spec_info.add(
+                    meta_info=output["meta_info"],
+                    response_length=sample.response_length,
+                )
 
     if "weight_version" in output["meta_info"]:
         sample.weight_versions.append(output["meta_info"]["weight_version"])
