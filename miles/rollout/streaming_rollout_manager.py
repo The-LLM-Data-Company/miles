@@ -239,15 +239,18 @@ def make_streaming_weight_policy(
 
 class StreamingGroupBuffer:
     def __init__(self, queue_cap: int) -> None:
-        self._queue: asyncio.PriorityQueue[tuple[tuple[int, float], CompletedGroup]] = asyncio.PriorityQueue(
+        self._queue: asyncio.PriorityQueue[tuple[tuple[int, float, int], CompletedGroup]] = asyncio.PriorityQueue(
             maxsize=queue_cap
         )
+        self._seq = 0
 
     def qsize(self) -> int:
         return self._queue.qsize()
 
     async def put(self, group: CompletedGroup) -> None:
-        await self._queue.put(((group.behavior_version, group.finished_ts), group))
+        # Tie-breaker prevents PriorityQueue from comparing CompletedGroup objects when priorities match.
+        self._seq += 1
+        await self._queue.put(((group.behavior_version, group.finished_ts, self._seq), group))
 
     async def get(self) -> CompletedGroup:
         _prio, item = await self._queue.get()

@@ -33,6 +33,7 @@ class UpdateWeight(abc.ABC):
     def __init__(self, args: Namespace, model: torch.nn.Module) -> None:
         self.args = args
         self.model = model
+        self.weight_version: str | None = None
 
     @abc.abstractmethod
     def connect_rollout_engines(
@@ -43,6 +44,11 @@ class UpdateWeight(abc.ABC):
         pass
 
     def update_weights(self) -> None:
+        if self.weight_version is None:
+            self.weight_version = "1"
+        else:
+            self.weight_version = str(int(self.weight_version) + 1)
+
         bucket = []
         bucket_size = 0
         for name, param in self.model.state_dict().items():
@@ -162,6 +168,7 @@ class UpdateWeightFromTensor(UpdateWeight):
                     "serialized_named_tensors": [tensors[i] for tensors in gathered_serialized_batches],
                     "load_format": "flattened_bucket",
                     "flush_cache": False,
+                    "weight_version": self.weight_version,
                 }
                 ref = self._ipc_engine.update_weights_from_tensor.remote(**kwargs)
                 ray.get(ref)
@@ -175,9 +182,7 @@ class UpdateWeightFromDistributed(UpdateWeight):
     """Broadcast weights via a temporary NCCL group to rollout engines."""
 
     def __init__(self, args: Namespace, model: torch.nn.Module) -> None:
-        self.args = args
-        self.model = model
-        self.weight_version: str | None = None
+        super().__init__(args, model)
 
     def connect_rollout_engines(
         self,
@@ -236,6 +241,7 @@ class UpdateWeightFromDistributed(UpdateWeight):
                 dtypes=[param.dtype for _, param in named_tensors],
                 shapes=[param.shape for _, param in named_tensors],
                 group_name=self._group_name,
+                weight_version=self.weight_version,
             )
             for engine in self.rollout_engines
         ]

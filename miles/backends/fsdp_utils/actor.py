@@ -793,6 +793,8 @@ class FSDPTrainRayActor(TrainRayActor):
 
         if self.args.colocate:
             self.weight_updater.connect_rollout_engines(subset, rollout_engine_lock)
+            if version is not None:
+                self.weight_updater.weight_version = str(version - 1)
             self.weight_updater.update_weights()
             dist.barrier(group=get_gloo_group())
             clear_memory()
@@ -804,7 +806,6 @@ class FSDPTrainRayActor(TrainRayActor):
         prev_rollout_engine_lock = getattr(self.weight_updater, "rollout_engine_lock", None)
         prev_group_name = getattr(self.weight_updater, "_group_name", None)
         prev_model_update_groups = getattr(self.weight_updater, "_model_update_groups", None)
-        prev_weight_version = getattr(self.weight_updater, "weight_version", None)
         prev_is_src_rank = getattr(self.weight_updater, "_is_src_rank", None)
 
         model_update_group = None
@@ -814,7 +815,8 @@ class FSDPTrainRayActor(TrainRayActor):
             self.weight_updater._group_name = group_name
             self.weight_updater._model_update_groups = None
             self.weight_updater._is_src_rank = dist.get_rank() == 0
-            self.weight_updater.weight_version = str(version) if version is not None else None
+            if version is not None:
+                self.weight_updater.weight_version = str(version - 1)
 
             if dist.get_rank() == 0:
                 model_update_group = connect_rollout_engines_subset_from_distributed(self.args, subset, group_name)
@@ -832,7 +834,6 @@ class FSDPTrainRayActor(TrainRayActor):
             self.weight_updater.rollout_engine_lock = prev_rollout_engine_lock
             self.weight_updater._group_name = prev_group_name
             self.weight_updater._model_update_groups = prev_model_update_groups
-            self.weight_updater.weight_version = prev_weight_version
             self.weight_updater._is_src_rank = prev_is_src_rank
 
             dist.barrier(group=get_gloo_group())
