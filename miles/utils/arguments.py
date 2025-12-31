@@ -1457,12 +1457,6 @@ def miles_validate_args(args):
                 f"--streaming-async-weight-update-mode={args.streaming_async_weight_update_mode} is not supported"
             )
 
-        if args.balance_data and args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline"]:
-            raise ValueError(
-                "--streaming-async group-as-atom requires not splitting prompt groups across DP partitions; "
-                "disable --balance-data for this advantage estimator."
-            )
-
         if args.prefill_num_servers is not None:
             raise ValueError("--streaming-async does not support prefill-decode disaggregation (--prefill-num-servers)")
 
