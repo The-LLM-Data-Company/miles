@@ -474,6 +474,34 @@ class MegatronTrainRayActor(TrainRayActor):
         save(iteration, self.model, self.optimizer, self.opt_param_scheduler)
 
     @timer
+    def update_rollout_engines(self, engine_indices: list[int], version: int | None = None) -> None:
+        if self.args.debug_train_only or self.args.debug_rollout_only:
+            return
+
+        if not engine_indices:
+            return
+
+        if self.args.offload_train:
+            reload_process_groups()
+
+        rollout_engines, rollout_engine_lock, _num_new_engines = ray.get(
+            self.rollout_manager.get_rollout_engines_and_lock.remote()
+        )
+        subset = [rollout_engines[i] for i in engine_indices]
+
+        self.weight_updater.connect_rollout_engines(subset, rollout_engine_lock)
+        dist.barrier(group=get_gloo_group())
+
+        if version is not None:
+            self.weight_updater.weight_version = version - 1
+
+        with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
+            self.weight_updater.update_weights()
+
+        if self.args.offload_train:
+            destroy_process_groups()
+
+    @timer
     def update_weights(self) -> None:
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return

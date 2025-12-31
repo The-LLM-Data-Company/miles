@@ -132,6 +132,28 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="Whether to enable true-on-policy mode.",
             )
             parser.add_argument(
+                "--streaming-async",
+                action="store_true",
+                default=False,
+                help="Enable streaming async rollouts",
+            )
+            parser.add_argument(
+                "--max-staleness-versions",
+                type=int,
+                default=1,
+                help="Drop rollout groups older than this many policy versions in streaming async mode.",
+            )
+            parser.add_argument(
+                "--streaming-async-weight-update-mode",
+                type=str,
+                default="rolling_drain",
+                choices=["rolling_drain"],
+                help=(
+                    "Weight update policy for --streaming-async. "
+                    "rolling_drain updates one rollout engine at a time after it drains."
+                ),
+            )
+            parser.add_argument(
                 "--train-env-vars",
                 type=json.loads,
                 default="{}",
@@ -1425,6 +1447,24 @@ def miles_validate_args(args):
 
     if args.use_rollout_logprobs:
         assert not args.use_tis, "use_rollout_logprobs and use_tis cannot be set at the same time."
+
+    if getattr(args, "streaming_async", False):
+        if args.max_staleness_versions < 0:
+            raise ValueError("--max-staleness-versions must be >= 0")
+
+        if args.streaming_async_weight_update_mode not in ["rolling_drain"]:
+            raise ValueError(
+                f"--streaming-async-weight-update-mode={args.streaming_async_weight_update_mode} is not supported"
+            )
+
+        if args.prefill_num_servers is not None:
+            raise ValueError("--streaming-async does not support prefill-decode disaggregation (--prefill-num-servers)")
+
+        if getattr(args, "use_miles_router", False):
+            raise ValueError("--streaming-async does not support MilesRouter")
+
+        if not args.use_tis:
+            logger.warning("--streaming-async is enabled; consider adding --use-tis for off-policy tolerance.")
 
     if args.get_mismatch_metrics:
         assert (
