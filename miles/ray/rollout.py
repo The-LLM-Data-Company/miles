@@ -181,10 +181,12 @@ class RolloutManager:
         dropped_groups = int(extra.get("dropped_groups") or 0)
         dropped_staleness_values = extra.get("dropped_staleness_values") or []
         stats = self._streaming.stats()
+        watermark = self._streaming.get_inflight_watermark()
 
         log_dict: dict[str, Any] = {
             "rollout/stream/queue_size_groups": stats["queue_size_groups"],
             "rollout/stream/inflight_groups": stats["inflight_groups"],
+            "rollout/stream/min_inflight_behavior_version": watermark.get("min_inflight_behavior_version"),
             "rollout/stream/groups_produced_per_s": stats["groups_produced_per_s"],
             "rollout/stream/groups_consumed_per_s": stats["groups_consumed_per_s"],
             "rollout/stream/empty_wait_s": extra.get("empty_wait_s", 0.0),
@@ -215,6 +217,11 @@ class RolloutManager:
         self._trainer_version = version
         if self._streaming is not None:
             self._streaming.notify_new_version(version)
+
+    async def get_streaming_inflight_watermark(self) -> dict[str, Any]:
+        if self._streaming is None:
+            return {}
+        return self._streaming.get_inflight_watermark()
 
     def eval(self, rollout_id):
         if self.args.debug_train_only:

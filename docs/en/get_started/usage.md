@@ -183,7 +183,7 @@ Additionally, we provide a `metadata_key`, which defaults to `"metadata"`. When 
 
 - `--streaming-async`: Enable streaming rollout generation (group-as-atom) via the SGLang router.
 - `--pipeline-weight-update-interval`: Trainer steps between rollout engine weight updates (default: 1).
-- `--pipeline-max-weight-lag`: Drop prompt groups whose submit-version lags the current weights by more than this many versions (default: 4).
+- `--pipeline-max-weight-lag`: Drop prompt groups whose submit-version lags the current weights by more than this many versions (default: 4). The trainer also gates weight updates to keep inflight groups within this bound.
 - `--use-tis` is recommended in streaming mode to tolerate mildly off-policy data.
 
 ## Custom Rollout Function

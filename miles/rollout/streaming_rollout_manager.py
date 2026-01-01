@@ -84,6 +84,7 @@ class StreamingRolloutManager:
         self._stop_event = asyncio.Event()
         self._producer_task: asyncio.Task | None = None
         self._pending: set[asyncio.Task] = set()
+        self._inflight_submit_versions: dict[asyncio.Task, int] = {}
 
         self._produced_groups = 0
         self._consumed_groups = 0
@@ -131,6 +132,7 @@ class StreamingRolloutManager:
 
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
+        self._inflight_submit_versions.clear()
 
     def stats(self) -> dict[str, Any]:
         """Return producer/consumer metrics."""
@@ -140,6 +142,22 @@ class StreamingRolloutManager:
             "inflight_groups": len(self._pending),
             "groups_produced_per_s": self._produced_groups / elapsed,
             "groups_consumed_per_s": self._consumed_groups / elapsed,
+            "published_version": self._published_version,
+        }
+
+    def get_inflight_watermark(self) -> dict[str, Any]:
+        """Return inflight watermark for publish-brake gating.
+
+        Returns:
+            dict with:
+              - min_inflight_behavior_version: oldest w_first among inflight groups (or None)
+              - inflight_count: number of inflight groups
+              - published_version: current published trainer version
+        """
+        inflight_versions = list(self._inflight_submit_versions.values())
+        return {
+            "min_inflight_behavior_version": min(inflight_versions) if inflight_versions else None,
+            "inflight_count": len(inflight_versions),
             "published_version": self._published_version,
         }
 
@@ -203,9 +221,11 @@ class StreamingRolloutManager:
                 )
             )
             self._pending.add(task)
+            self._inflight_submit_versions[task] = behavior_version
 
             def _done_callback(t: asyncio.Task) -> None:
                 self._pending.discard(t)
+                self._inflight_submit_versions.pop(t, None)
 
             task.add_done_callback(_done_callback)
 
