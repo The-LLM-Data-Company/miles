@@ -14,6 +14,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from miles.backends.sglang_utils.sglang_engine import SGLangEngine
 from miles.rollout.base_types import call_rollout_fn
+from miles.rollout.streaming_rollout_manager import StreamingRolloutManager, derive_streaming_start_params
 from miles.utils import tracking_utils
 from miles.utils.health_monitor import RolloutHealthMonitor
 from miles.utils.http_utils import _wrap_ipv6, find_available_port, get_host_info, init_http_client
@@ -75,6 +76,10 @@ class RolloutManager:
         if self.args.use_fault_tolerance:
             self._health_monitor = RolloutHealthMonitor(self, args)
 
+        self._streaming: StreamingRolloutManager | None = None
+        self._trainer_version: int = 0
+        self._streaming_rollout_id: int | None = None
+
     def dispose(self):
         if self._metric_checker is not None:
             self._metric_checker.dispose()
@@ -107,6 +112,109 @@ class RolloutManager:
                 self.num_new_engines = init_rollout_engines(self.args, self.pg, self.all_rollout_engines)
             else:
                 self.num_new_engines = 0
+
+    async def start_streaming(self, start_rollout_id: int):
+        if self.args.debug_train_only or self.args.debug_rollout_only:
+            raise RuntimeError("--streaming-async is not supported in debug-only modes")
+
+        if self._streaming is not None:
+            return
+
+        num_engines = len(self.rollout_engines)
+        if num_engines == 0:
+            raise RuntimeError("No rollout engines available for --streaming-async")
+
+        params = derive_streaming_start_params(self.args, num_engines=num_engines)
+
+        self._streaming_rollout_id = start_rollout_id
+
+        self._streaming = StreamingRolloutManager(
+            self.args,
+            self.data_source,
+            groups_per_train_step=params.groups_per_train_step,
+            queue_target=params.queue_target,
+            queue_cap=params.queue_cap,
+            inflight_target=params.inflight_target,
+            initial_published_version=self._trainer_version,
+        )
+        self._streaming.start()
+
+        return
+
+    async def stop_streaming(self):
+        if self._streaming is None:
+            return
+        await self._streaming.stop()
+        self._streaming = None
+
+    async def get_next_train_batch(self) -> list[Box]:
+        if self._streaming is None:
+            raise RuntimeError("Streaming is not started")
+        if self._streaming_rollout_id is None:
+            raise RuntimeError("Streaming rollout id is not initialized")
+
+        rollout_id = self._streaming_rollout_id
+
+        groups, extra = await self._streaming.get_next_groups(
+            num_groups=self.args.rollout_batch_size,
+            target_version=self._trainer_version,
+        )
+
+        samples: list[Sample] = []
+        for g in groups:
+            samples.extend(g.group)
+
+        data = self._convert_samples_to_train_data(samples)
+        # Streaming-only: propagate policy versions.
+        data["weight_version_first"] = [
+            (sample.metadata.get("weight_version_first") if sample.metadata else None)
+            or (sample.weight_versions[0] if sample.weight_versions else None)
+            for sample in samples
+        ]
+        data["weight_version_last"] = [
+            (sample.weight_versions[-1] if sample.weight_versions else None) for sample in samples
+        ]
+        refs = self._split_train_data_by_dp(data, self.train_parallel_config["dp_size"])
+
+        staleness_values = extra.get("staleness_values") or []
+        ages_s = extra.get("queue_ages_s") or []
+        dropped_groups = int(extra.get("dropped_groups") or 0)
+        dropped_staleness_values = extra.get("dropped_staleness_values") or []
+        stats = self._streaming.stats()
+
+        log_dict: dict[str, Any] = {
+            "rollout/stream/queue_size_groups": stats["queue_size_groups"],
+            "rollout/stream/inflight_groups": stats["inflight_groups"],
+            "rollout/stream/groups_produced_per_s": stats["groups_produced_per_s"],
+            "rollout/stream/groups_consumed_per_s": stats["groups_consumed_per_s"],
+            "rollout/stream/empty_wait_s": extra.get("empty_wait_s", 0.0),
+            "rollout/stream/dropped_groups": dropped_groups,
+        }
+
+        if staleness_values:
+            for s, items in group_by(staleness_values).items():
+                log_dict[f"rollout/stream/staleness_versions_hist/v{s}"] = len(items)
+
+        if dropped_staleness_values:
+            for s, items in group_by(dropped_staleness_values).items():
+                log_dict[f"rollout/stream/dropped_staleness_versions_hist/v{s}"] = len(items)
+
+        if ages_s:
+            log_dict["rollout/stream/queue_age_s_p50"] = float(np.percentile(ages_s, 50))
+            log_dict["rollout/stream/queue_age_s_p95"] = float(np.percentile(ages_s, 95))
+
+        step = compute_rollout_step(self.args, rollout_id)
+        log_dict["rollout/step"] = step
+        tracking_utils.log(self.args, log_dict, step_key="rollout/step")
+
+        self._streaming_rollout_id += 1
+
+        return refs
+
+    async def notify_new_version(self, version: int):
+        self._trainer_version = version
+        if self._streaming is not None:
+            self._streaming.notify_new_version(version)
 
     def eval(self, rollout_id):
         if self.args.debug_train_only:
@@ -300,7 +408,7 @@ class RolloutManager:
             rollout_data = {}
             partition = partitions[i]
             rollout_data["partition"] = partition
-            for key in [
+            keys_to_split = [
                 "tokens",
                 "multimodal_inputs",
                 "response_lengths",
@@ -313,7 +421,13 @@ class RolloutManager:
                 "rollout_routed_experts",
                 "prompt",
                 "teacher_log_probs",
-            ]:
+            ]
+            if getattr(self.args, "streaming_async", False):
+                keys_to_split += [
+                    "weight_version_first",
+                    "weight_version_last",
+                ]
+            for key in keys_to_split:
                 if key not in data:
                     continue
                 val = [data[key][j] for j in partition]

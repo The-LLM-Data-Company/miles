@@ -790,7 +790,18 @@ class FSDPTrainRayActor(TrainRayActor):
             self.weight_updater.connect_rollout_engines(rollout_engines, rollout_engine_lock)
             dist.barrier(group=get_gloo_group())
 
+        if getattr(self.args, "streaming_async", False):
+            if dist.get_rank() == 0:
+                ray.get([engine.pause_generation.remote(mode="in_place") for engine in rollout_engines])
+            dist.barrier(group=get_gloo_group())
+
         self.weight_updater.update_weights()
+
+        if getattr(self.args, "streaming_async", False):
+            dist.barrier(group=get_gloo_group())
+            if dist.get_rank() == 0:
+                ray.get([engine.continue_generation.remote() for engine in rollout_engines])
+            dist.barrier(group=get_gloo_group())
         clear_memory()
 
     def _create_ref_model(self, ref_load_path: str | None):

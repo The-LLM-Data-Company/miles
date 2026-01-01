@@ -33,6 +33,7 @@ class UpdateWeight(abc.ABC):
     def __init__(self, args: Namespace, model: torch.nn.Module) -> None:
         self.args = args
         self.model = model
+        self.weight_version: str | None = None
 
     @abc.abstractmethod
     def connect_rollout_engines(
@@ -43,6 +44,14 @@ class UpdateWeight(abc.ABC):
         pass
 
     def update_weights(self) -> None:
+        if getattr(self.args, "streaming_async", False):
+            if self.weight_version is None:
+                self.weight_version = "1"
+            else:
+                self.weight_version = str(int(self.weight_version) + 1)
+        else:
+            self.weight_version = None
+
         bucket = []
         bucket_size = 0
         for name, param in self.model.state_dict().items():
@@ -163,20 +172,23 @@ class UpdateWeightFromTensor(UpdateWeight):
                     "load_format": "flattened_bucket",
                     "flush_cache": False,
                 }
+                if self.weight_version is not None:
+                    kwargs["weight_version"] = self.weight_version
                 ref = self._ipc_engine.update_weights_from_tensor.remote(**kwargs)
                 ray.get(ref)
 
-        if dist.get_rank() == self._ipc_gather_src:
-            ref = self._ipc_engine.flush_cache.remote()
-            ray.get(ref)
+            # Flush after tensor-based weight update.
+            if not getattr(self.args, "streaming_async", False):
+                ref = self._ipc_engine.flush_cache.remote()
+                ray.get(ref)
+
 
 
 class UpdateWeightFromDistributed(UpdateWeight):
     """Broadcast weights via a temporary NCCL group to rollout engines."""
 
     def __init__(self, args: Namespace, model: torch.nn.Module) -> None:
-        self.args = args
-        self.model = model
+        super().__init__(args, model)
 
     def connect_rollout_engines(
         self,
@@ -235,6 +247,7 @@ class UpdateWeightFromDistributed(UpdateWeight):
                 dtypes=[param.dtype for _, param in named_tensors],
                 shapes=[param.shape for _, param in named_tensors],
                 group_name=self._group_name,
+                weight_version=self.weight_version if self.weight_version is not None else None,
             )
             for engine in self.rollout_engines
         ]

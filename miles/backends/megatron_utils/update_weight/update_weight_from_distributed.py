@@ -73,13 +73,17 @@ class UpdateWeightFromDistributed:
     @torch.no_grad()
     def update_weights(self) -> None:
         """
-        Pause → flush → non-expert (TP) → expert (EP) → continue. Progress on PP source.
+        Streaming async: pause(in_place) → non-expert (TP) → expert (EP) → continue.
+        Default: pause → flush → non-expert (TP) → expert (EP) → continue.
         """
         self.weight_version += 1
 
         if dist.get_rank() == 0:
-            ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
-            ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
+            if getattr(self.args, "streaming_async", False):
+                ray.get([engine.pause_generation.remote(mode="in_place") for engine in self.rollout_engines])
+            else:
+                ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
+                ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
 
         buffer_size = 0
