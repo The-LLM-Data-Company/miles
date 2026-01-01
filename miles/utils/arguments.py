@@ -132,6 +132,24 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="Whether to enable true-on-policy mode.",
             )
             parser.add_argument(
+                "--streaming-async",
+                action="store_true",
+                default=False,
+                help="Enable streaming async rollouts",
+            )
+            parser.add_argument(
+                "--pipeline-weight-update-interval",
+                type=int,
+                default=1,
+                help="Trainer steps between rollout engine weight updates in streaming async mode.",
+            )
+            parser.add_argument(
+                "--pipeline-max-weight-lag",
+                type=int,
+                default=4,
+                help="Drop prompt groups with weight lag greater than this many versions in streaming async mode.",
+            )
+            parser.add_argument(
                 "--train-env-vars",
                 type=json.loads,
                 default="{}",
@@ -1425,6 +1443,16 @@ def miles_validate_args(args):
 
     if args.use_rollout_logprobs:
         assert not args.use_tis, "use_rollout_logprobs and use_tis cannot be set at the same time."
+
+    if getattr(args, "streaming_async", False):
+        if args.pipeline_weight_update_interval < 1:
+            raise ValueError("--pipeline-weight-update-interval must be >= 1")
+
+        if args.pipeline_max_weight_lag < 0:
+            raise ValueError("--pipeline-max-weight-lag must be >= 0")
+
+        if not args.use_tis:
+            logger.warning("--streaming-async is enabled; consider adding --use-tis for off-policy tolerance.")
 
     if args.get_mismatch_metrics:
         assert (
