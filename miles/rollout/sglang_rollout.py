@@ -138,6 +138,9 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
 
     if args.use_rollout_routing_replay:
         payload["return_routed_experts"] = True
+        logger.critical(
+            f"[ROUTING_REPLAY_DEBUG] Setting return_routed_experts=True in /generate payload for sample index {sample.index}"
+        )
 
     if sample.multimodal_inputs and sample.multimodal_inputs["images"]:
         image_data = sample.multimodal_inputs["images"]
@@ -174,6 +177,10 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         sample.rollout_log_probs += new_response_log_probs
 
     if "routed_experts" in output["meta_info"]:
+        logger.critical(
+            f"[ROUTING_REPLAY_DEBUG] routed_experts found in response meta_info for sample index {sample.index}. "
+            f"Keys in meta_info: {list(output['meta_info'].keys())}"
+        )
         sample.rollout_routed_experts = np.frombuffer(
             pybase64.b64decode(output["meta_info"]["routed_experts"].encode("ascii")),
             dtype=np.int32,
@@ -182,6 +189,16 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
             args.num_layers,
             args.moe_router_topk,
         )
+        logger.critical(
+            f"[ROUTING_REPLAY_DEBUG] Decoded rollout_routed_experts shape: {sample.rollout_routed_experts.shape} "
+            f"for sample index {sample.index}"
+        )
+    else:
+        if args.use_rollout_routing_replay:
+            logger.critical(
+                f"[ROUTING_REPLAY_DEBUG] WARNING: routed_experts NOT found in response meta_info for sample index {sample.index}. "
+                f"Keys in meta_info: {list(output['meta_info'].keys())}"
+            )
 
     sample.update_from_meta_info(args, output["meta_info"])
 
