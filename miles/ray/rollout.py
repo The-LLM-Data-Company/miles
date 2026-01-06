@@ -263,7 +263,20 @@ class RolloutManager:
             train_data["rollout_log_probs"] = [sample.rollout_log_probs for sample in samples]
 
         if samples[0].rollout_routed_experts is not None:
+            logger.critical(
+                f"[ROUTING_REPLAY_DEBUG] rollout_routed_experts attribute EXISTS on first sample. "
+                f"Total samples: {len(samples)}, "
+                f"First sample routed_experts shape: {samples[0].rollout_routed_experts.shape}"
+            )
             train_data["rollout_routed_experts"] = [sample.rollout_routed_experts for sample in samples]
+            logger.critical(
+                f"[ROUTING_REPLAY_DEBUG] Added rollout_routed_experts to train_data with {len(train_data['rollout_routed_experts'])} entries"
+            )
+        else:
+            logger.critical(
+                f"[ROUTING_REPLAY_DEBUG] WARNING: rollout_routed_experts attribute is None on first sample. "
+                f"Total samples: {len(samples)}"
+            )
 
         if samples[0].train_metadata is not None:
             train_data["metadata"] = [sample.train_metadata for sample in samples]
@@ -296,6 +309,10 @@ class RolloutManager:
 
         rollout_data_refs = []
 
+        logger.critical(
+            f"[ROUTING_REPLAY_DEBUG] _split_train_data_by_dp: Keys in data before split: {list(data.keys())}"
+        )
+
         for i in range(dp_size):
             rollout_data = {}
             partition = partitions[i]
@@ -326,6 +343,11 @@ class RolloutManager:
                 if key not in data:
                     continue
                 rollout_data[key] = data[key]
+
+            logger.critical(
+                f"[ROUTING_REPLAY_DEBUG] _split_train_data_by_dp: DP rank {i} rollout_data keys: {list(rollout_data.keys())}, "
+                f"has rollout_routed_experts: {'rollout_routed_experts' in rollout_data}"
+            )
             rollout_data_refs.append(Box(ray.put(rollout_data)))
         return rollout_data_refs
 

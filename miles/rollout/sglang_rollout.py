@@ -126,6 +126,9 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
 
     if args.use_rollout_routing_replay:
         payload["return_routed_experts"] = True
+        logger.critical(
+            f"[ROUTING_REPLAY_DEBUG] Setting return_routed_experts=True in /generate payload for sample index {sample.index}"
+        )
 
     if image_data:
         payload["image_data"] = [encode_image_for_rollout_engine(image) for image in image_data]
@@ -185,8 +188,22 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         sample.weight_versions.append(output["meta_info"]["weight_version"])
 
     if "routed_experts" in output["meta_info"]:
+        logger.critical(
+            f"[ROUTING_REPLAY_DEBUG] routed_experts found in response meta_info for sample index {sample.index}. "
+            f"Keys in meta_info: {list(output['meta_info'].keys())}"
+        )
         assert len(output["meta_info"]["routed_experts"]) == len(sample.tokens) - 1
         sample.rollout_routed_experts = np.array(output["meta_info"]["routed_experts"])
+        logger.critical(
+            f"[ROUTING_REPLAY_DEBUG] Set rollout_routed_experts array with shape: {sample.rollout_routed_experts.shape} "
+            f"for sample index {sample.index}"
+        )
+    else:
+        if args.use_rollout_routing_replay:
+            logger.critical(
+                f"[ROUTING_REPLAY_DEBUG] WARNING: routed_experts NOT found in response meta_info for sample index {sample.index}. "
+                f"Keys in meta_info: {list(output['meta_info'].keys())}"
+            )
 
     match output["meta_info"]["finish_reason"]["type"]:
         case "length":
