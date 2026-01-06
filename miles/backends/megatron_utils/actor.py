@@ -237,9 +237,23 @@ class MegatronTrainRayActor(TrainRayActor):
                 )
             ]
         if "rollout_routed_experts" in rollout_data:
+            logger.critical(
+                f"[ROUTING_REPLAY_DEBUG] rollout_routed_experts found in rollout_data. "
+                f"Number of entries: {len(rollout_data['rollout_routed_experts'])}, "
+                f"First entry shape: {rollout_data['rollout_routed_experts'][0].shape if len(rollout_data['rollout_routed_experts']) > 0 else 'N/A'}"
+            )
             rollout_data["rollout_routed_experts"] = [
                 torch.from_numpy(r) for r in rollout_data["rollout_routed_experts"]
             ]
+            logger.critical(
+                f"[ROUTING_REPLAY_DEBUG] Converted rollout_routed_experts to torch tensors. "
+                f"First tensor shape: {rollout_data['rollout_routed_experts'][0].shape if len(rollout_data['rollout_routed_experts']) > 0 else 'N/A'}"
+            )
+        else:
+            logger.critical(
+                f"[ROUTING_REPLAY_DEBUG] WARNING: rollout_routed_experts NOT found in rollout_data. "
+                f"Keys in rollout_data: {list(rollout_data.keys())}"
+            )
         return rollout_data
 
     def _switch_model(self, target_tag: str) -> None:
@@ -249,10 +263,24 @@ class MegatronTrainRayActor(TrainRayActor):
         self._active_model_tag = target_tag
 
     def fill_routing_replay(self, data_iterator, num_microbatches, rollout_data):
+        logger.critical(
+            f"[ROUTING_REPLAY_DEBUG] fill_routing_replay called. "
+            f"use_rollout_routing_replay={self.args.use_rollout_routing_replay}, "
+            f"Keys in rollout_data: {list(rollout_data.keys())}"
+        )
         if "rollout_routed_experts" not in rollout_data:
+            logger.critical(
+                f"[ROUTING_REPLAY_DEBUG] ERROR: rollout_routed_experts NOT found in rollout_data! "
+                f"Available keys: {list(rollout_data.keys())}. "
+                f"This will raise ValueError."
+            )
             raise ValueError(
                 "rollout_routed_experts is required in rollout_data when use_rollout_routing_replay is set."
             )
+        logger.critical(
+            f"[ROUTING_REPLAY_DEBUG] rollout_routed_experts successfully found in rollout_data. "
+            f"Proceeding with routing replay setup."
+        )
 
         from megatron.core.transformer.transformer_block import get_num_layers_to_build
         from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
