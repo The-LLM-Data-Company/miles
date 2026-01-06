@@ -120,8 +120,10 @@ RUN cd Megatron-LM && \
 # ====================================== Install main package ============================================
 
 # TODO may improve
-ARG MILES_COMMIT=main
-RUN git clone https://github.com/radixark/miles.git /root/miles && \
+ARG MILES_BRANCH=rohit/debug-routing-replay-old
+ARG MILES_REPO=https://github.com/The-LLM-Data-Company/miles.git
+
+RUN git clone ${MILES_REPO} /root/miles && \
   cd /root/miles && \
-  git checkout ${MILES_COMMIT} && \
+  git checkout ${MILES_BRANCH} && \
   pip install -e . --no-deps
