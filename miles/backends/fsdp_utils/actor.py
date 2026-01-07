@@ -25,6 +25,7 @@ from miles.utils.ppo_utils import (
     compute_gspo_kl,
     compute_opsm_mask,
     compute_policy_loss,
+    compute_sapo_loss,
     vanilla_tis_function,
 )
 from miles.utils.processing_utils import load_processor, load_tokenizer
@@ -540,7 +541,7 @@ class FSDPTrainRayActor(TrainRayActor):
             )
 
     def _train_core(self, rollout_id: int, rollout_data) -> None:
-        if self.args.advantage_estimator in ["grpo", "gspo"]:
+        if self.args.advantage_estimator in ["grpo", "gspo", "sapo"]:
             rollout_data["advantages"] = rollout_data["returns"] = [
                 torch.tensor([rollout_data["rewards"][i]] * rollout_data["response_lengths"][i])
                 for i in range(len(rollout_data["rewards"]))
@@ -649,7 +650,13 @@ class FSDPTrainRayActor(TrainRayActor):
                 loss_masks=loss_masks,
             )
 
-        pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, self.args.eps_clip, self.args.eps_clip_high)
+        if self.args.advantage_estimator == "sapo":
+            logger.info(f"Using SAPO with tau_pos {self.args.sapo_tau_pos} and tau_neg {self.args.sapo_tau_neg}")
+            pg_loss, pg_clipfrac = compute_sapo_loss(
+                ppo_kl=ppo_kl, advantages=advantages, tau_pos=self.args.sapo_tau_pos, tau_neg=self.args.sapo_tau_neg
+            )
+        else:
+            pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, self.args.eps_clip, self.args.eps_clip_high)
 
         if self.args.use_opsm:
             pg_loss = pg_loss * opsm_mask

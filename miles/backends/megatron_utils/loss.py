@@ -3,6 +3,7 @@ from collections.abc import Callable, Iterator
 from typing import Any
 
 import torch
+import logging
 from megatron.core import mpu
 from torch.utils.checkpoint import checkpoint
 
@@ -14,6 +15,7 @@ from miles.utils.ppo_utils import (
     compute_gspo_kl,
     compute_opsm_mask,
     compute_policy_loss,
+    compute_sapo_loss,
     get_advantages_and_returns_batch,
     get_grpo_returns,
     get_reinforce_plus_plus_baseline_advantages,
@@ -23,6 +25,8 @@ from miles.utils.types import RolloutBatch
 
 from .cp_utils import all_gather_with_cp, get_logits_and_tokens_offset_with_cp, get_sum_of_sample_mean
 
+
+logger = logging.getLogger(__name__)
 
 def get_responses(
     logits: torch.Tensor,
@@ -223,7 +227,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
 
     This function extracts rewards, log-probs, values, and masks from
     `rollout_data`, computes KL divergences, then applies the chosen advantage
-    estimator. Supported methods: "grpo", "gspo", "ppo", "reinforce_plus_plus",
+    estimator. Supported methods: "grpo", "gspo", "ppo", "sapo", "reinforce_plus_plus",
     and "reinforce_plus_plus_baseline". When `args.normalize_advantages` is
     True, advantages are whitened across the data-parallel group using masked
     statistics.
@@ -266,7 +270,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
             for i in range(len(log_probs))
         ]
 
-    if args.advantage_estimator in ["grpo", "gspo"]:
+    if args.advantage_estimator in ["grpo", "gspo", "sapo"]:
         rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
         returns = get_grpo_returns(rewards, kl)
         # TODO: is the copy necessary?
@@ -531,7 +535,13 @@ def policy_loss_function(
         log_probs = torch.cat(log_probs, dim=0)
         ppo_kl = old_log_probs - log_probs
 
-    pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, args.eps_clip, args.eps_clip_high)
+    if args.advantage_estimator == "sapo":
+        logger.info(f"Using SAPO with tau_pos {args.sapo_tau_pos} and tau_neg {args.sapo_tau_neg}")
+        pg_loss, pg_clipfrac = compute_sapo_loss(
+            ppo_kl=ppo_kl, advantages=advantages, tau_pos=args.sapo_tau_pos, tau_neg=args.sapo_tau_neg
+        )
+    else:
+        pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, args.eps_clip, args.eps_clip_high)
 
     if args.use_opsm:
         pg_loss = pg_loss * opsm_mask
