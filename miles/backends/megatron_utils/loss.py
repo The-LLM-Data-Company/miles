@@ -3,6 +3,7 @@ from collections.abc import Callable, Iterator
 from typing import Any
 
 import torch
+import logging
 from megatron.core import mpu
 from torch.utils.checkpoint import checkpoint
 
@@ -24,6 +25,8 @@ from miles.utils.types import RolloutBatch
 
 from .cp_utils import all_gather_with_cp, get_logits_and_tokens_offset_with_cp, get_sum_of_sample_mean
 
+
+logger = logging.getLogger(__name__)
 
 def get_responses(
     logits: torch.Tensor,
@@ -533,6 +536,7 @@ def policy_loss_function(
         ppo_kl = old_log_probs - log_probs
 
     if args.advantage_estimator == "sapo":
+        logger.info(f"Using SAPO with tau_pos {args.sapo_tau_pos} and tau_neg {args.sapo_tau_neg}")
         pg_loss, pg_clipfrac = compute_sapo_loss(
             ppo_kl=ppo_kl, advantages=advantages, tau_pos=args.sapo_tau_pos, tau_neg=args.sapo_tau_neg
         )

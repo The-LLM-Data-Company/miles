@@ -651,6 +651,7 @@ class FSDPTrainRayActor(TrainRayActor):
             )
 
         if self.args.advantage_estimator == "sapo":
+            logger.info(f"Using SAPO with tau_pos {self.args.sapo_tau_pos} and tau_neg {self.args.sapo_tau_neg}")
             pg_loss, pg_clipfrac = compute_sapo_loss(
                 ppo_kl=ppo_kl, advantages=advantages, tau_pos=self.args.sapo_tau_pos, tau_neg=self.args.sapo_tau_neg
             )
