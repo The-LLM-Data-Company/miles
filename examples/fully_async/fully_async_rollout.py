@@ -1,10 +1,12 @@
 import asyncio
 import atexit
+import os
 import queue
 import threading
 import time
 
 # Import core functions from sglang_rollout directly to avoid code duplication
+from miles.rollout.base_types import RolloutFnTrainOutput
 from miles.rollout.sglang_rollout import GenerateState, generate_and_rm_group
 from miles.utils.async_utils import run
 from miles.utils.types import Sample
@@ -14,13 +16,44 @@ _global_worker = None
 _worker_lock = threading.Lock()
 
 
+def _get_sample_head_version(sample: Sample) -> int:
+    # Version awareness: use the first SGLang-reported weight_version (head).
+    if not sample.weight_versions:
+        raise RuntimeError("Expected SGLang to return meta_info['weight_version'] so we can enforce staleness.")
+    return int(sample.weight_versions[0])
+
+
+def _get_group_head_version(group: list[Sample]) -> int:
+    # Group head version for off-policyness drop (min across samples).
+    if not group:
+        raise RuntimeError("Unexpected empty group from generate_and_rm_group().")
+    return min(_get_sample_head_version(sample) for sample in group)
+
+
+def _derive_current_train_version(args, rollout_id: int) -> int:
+    """Map rollout_id -> trainer weight version under `train_async.py` update cadence."""
+    update_interval_raw = getattr(args, "update_weights_interval", 1)
+    try:
+        update_interval = max(1, int(1 if update_interval_raw is None else update_interval_raw))
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"Invalid args.update_weights_interval={update_interval_raw!r}") from e
+
+    start_rollout_id_raw = getattr(args, "start_rollout_id", 0)
+    try:
+        start_rollout_id = int(0 if start_rollout_id_raw is None else start_rollout_id_raw)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"Invalid args.start_rollout_id={start_rollout_id_raw!r}") from e
+    return 1 + max(0, rollout_id - start_rollout_id) // update_interval
+
+
 def get_global_worker(args, data_buffer):
     """Get or create global worker"""
     global _global_worker
     with _worker_lock:
         if _global_worker is None or not _global_worker.worker_thread.is_alive():
             print("Creating new global async worker...")
-            _global_worker = AsyncRolloutWorker(args, data_buffer, concurrency=args.sglang_server_concurrency)
+            concurrency = getattr(args, "sglang_server_concurrency", 10) or 10
+            _global_worker = AsyncRolloutWorker(args, data_buffer, concurrency=concurrency)
             _global_worker.start()
         return _global_worker
 
@@ -45,16 +78,42 @@ class AsyncRolloutWorker:
         self.data_buffer = data_buffer  # Directly save data_buffer reference
         self.concurrency = concurrency
         self.running = True
-        self.output_queue = queue.Queue(maxsize=1000)  # Continuous output queue
+        # Staleness cap (η): max off-policyness / staleness in units of trainer weight versions.
+        # (We also use it to size default queue caps in groups: (η + 1) * rollout_batch_size.)
+        self.staleness_cap_batches = int(os.environ.get("MAX_STALENESS_BATCHES", "4"))
+        rollout_batch_size_raw = getattr(self.args, "rollout_batch_size", None)
+        try:
+            rollout_batch_size = int(rollout_batch_size_raw)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"Invalid args.rollout_batch_size={rollout_batch_size_raw!r}") from e
+        b = max(1, rollout_batch_size)
+        default_queue_cap_groups = max(1, (self.staleness_cap_batches + 1) * b)
+
+        # Optional knobs: allow overriding inflight and queue caps.
+        self.max_inflight_groups = max(1, int(os.environ.get("MAX_INFLIGHT_GROUPS", str(b))))
+        self.queue_cap_groups = max(1, int(os.environ.get("QUEUE_CAP_GROUPS", str(default_queue_cap_groups))))
+
+        # Completed groups are stored in a priority queue keyed by (head_weight_version, finished_ts, gid).
+        # This preferentially drains older-policy groups first (PipelineRL-style).
+        self.output_queue: queue.PriorityQueue = queue.PriorityQueue(maxsize=self.queue_cap_groups)
         self.worker_thread = None
         self.state = GenerateState(args)
 
+        self._metrics_lock = threading.Lock()
+        self._inflight_groups = 0
+        self._producer_blocked_s = 0.0
+        self._producer_block_events = 0
+        self._producer_blocked_start = None
+
     async def continuous_worker_loop(self):
         """Continuous work loop - constantly get data from data_buffer and process"""
-        print("Continuous async rollout worker started")
+        print(
+            "Continuous async rollout worker started "
+            f"({self.staleness_cap_batches=} {self.max_inflight_groups=} {self.queue_cap_groups=})"
+        )
 
         active_tasks = set()
-        max_concurrent_tasks = self.args.rollout_batch_size
+        max_concurrent_tasks = self.max_inflight_groups
         group_id_counter = 0
 
         while self.running:
@@ -68,9 +127,28 @@ class AsyncRolloutWorker:
                         except Exception as e:
                             print(f"Task failed with exception: {e}")
                     active_tasks -= done_tasks
+                with self._metrics_lock:
+                    self._inflight_groups = len(active_tasks)
 
-                # If active task count hasn't reached limit, try to get new data and start tasks
-                while len(active_tasks) < max_concurrent_tasks and self.running:
+                # Backpressure: if the completed output queue is full, stop submitting until it is drained.
+                if self.running and len(active_tasks) < max_concurrent_tasks and self.output_queue.full():
+                    with self._metrics_lock:
+                        if self._producer_blocked_start is None:
+                            self._producer_blocked_start = time.time()
+                            self._producer_block_events += 1
+                    await asyncio.sleep(0.1)
+                    continue
+
+                with self._metrics_lock:
+                    if self._producer_blocked_start is not None:
+                        self._producer_blocked_s += time.time() - self._producer_blocked_start
+                        self._producer_blocked_start = None
+
+                while (
+                    len(active_tasks) < max_concurrent_tasks
+                    and self.running
+                    and not self.output_queue.full()
+                ):
                     samples = self.data_buffer.get_samples(1)
 
                     for group in samples:
@@ -90,8 +168,25 @@ class AsyncRolloutWorker:
                         # Add completion callback
                         def make_callback(gid):
                             def task_done_callback(done_task):
-                                result = done_task.result()
-                                self.output_queue.put((gid, result))
+                                try:
+                                    result = done_task.result()
+                                except Exception as e:
+                                    # Keep the event loop healthy even if a task fails.
+                                    print(f"Task failed with exception: {e}")
+                                    return
+
+                                # IMPORTANT: never block the asyncio event loop thread in a callback.
+                                # queue.put() can block when the queue is full and stall all async progress.
+                                item = ((_get_group_head_version(result), time.time(), gid), (gid, result))
+                                try:
+                                    self.output_queue.put_nowait(item)
+                                except queue.Full:
+                                    # Offload the blocking put to a daemon thread so the event loop can keep running.
+                                    threading.Thread(
+                                        target=self.output_queue.put,
+                                        args=(item,),
+                                        daemon=True,
+                                    ).start()
 
                             return task_done_callback
 
@@ -109,6 +204,11 @@ class AsyncRolloutWorker:
         if active_tasks:
             print(f"Waiting for {len(active_tasks)} continuous tasks to complete...")
             await asyncio.wait(active_tasks)
+
+        with self._metrics_lock:
+            if self._producer_blocked_start is not None:
+                self._producer_blocked_s += time.time() - self._producer_blocked_start
+                self._producer_blocked_start = None
 
         print("Continuous async rollout worker stopped")
 
@@ -135,31 +235,59 @@ class AsyncRolloutWorker:
         completed = []
         while True:
             try:
-                result = self.output_queue.get_nowait()
-                completed.append(result)
+                _prio, item = self.output_queue.get_nowait()
+                completed.append(item)
             except queue.Empty:
                 break
         return completed
+
+    def try_get_completed_group(self) -> tuple | None:
+        """Try to get a single completed group without draining the entire queue."""
+        try:
+            _prio, item = self.output_queue.get_nowait()
+            return item
+        except queue.Empty:
+            return None
 
     def get_queue_size(self) -> int:
         """Get current output queue size"""
         return self.output_queue.qsize()
 
+    def get_inflight_groups(self) -> int:
+        with self._metrics_lock:
+            return self._inflight_groups
 
-async def generate_rollout_async(args, rollout_id: int, data_buffer) -> list[list[Sample]]:
+    def get_producer_blocked_s(self) -> float:
+        with self._metrics_lock:
+            blocked_s = self._producer_blocked_s
+            if self._producer_blocked_start is not None:
+                blocked_s += time.time() - self._producer_blocked_start
+            return blocked_s
+
+    def get_producer_block_events(self) -> int:
+        with self._metrics_lock:
+            return self._producer_block_events
+
+
+async def generate_rollout_async(args, rollout_id: int, data_buffer) -> tuple[list[list[Sample]], dict]:
     """
     Simplified asynchronous rollout generation - using global continuous worker
     """
-    assert args.rollout_global_dataset
+    if not getattr(args, "rollout_global_dataset", False):
+        raise ValueError("fully_async rollout requires --rollout-global-dataset")
 
     # Get global worker, which will run continuously
     worker = get_global_worker(args, data_buffer)
 
-    # Simplified: directly use rollout_batch_size as target
-    target_data_size = args.rollout_batch_size
+    target_data_size_raw = getattr(args, "rollout_batch_size", None)
+    try:
+        target_data_size = int(target_data_size_raw)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"Invalid args.rollout_batch_size={target_data_size_raw!r}") from e
+    if target_data_size < 1:
+        raise ValueError(f"Invalid args.rollout_batch_size={target_data_size_raw!r}; must be >= 1")
 
     data = []
-    completed_groups = {}
     do_print = True
 
     print(f"Starting async rollout generation for {target_data_size} groups")
@@ -170,28 +298,27 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> list[lis
     last_progress_time = start_time
     no_progress_timeout = 30.0  # Warn if no progress for 30 seconds
 
+    start_blocked_s = worker.get_producer_blocked_s()
+    start_blocked_events = worker.get_producer_block_events()
+    aborted_groups_requeued = 0
+    aborted_samples_requeued = 0
+    current_version = _derive_current_train_version(args, rollout_id)
+    max_head_offpolicyness = worker.staleness_cap_batches  # η, in trainer weight versions
+    stale_groups_dropped = 0
+    accepted_staleness_values = []
+    dropped_staleness_values = []
+
     while len(data) < target_data_size:
-        # Collect completed results
-        completed = worker.get_completed_groups()
-
-        made_progress = False
-        for group_id, group in completed:
-            completed_groups[group_id] = group
-            made_progress = True
-
-        if made_progress:
-            last_progress_time = time.time()
-
-        # Process completed groups in order (try to maintain order, but not strict requirement)
         processed_any = False
-
-        # Process all available completed groups
-        available_ids = list(completed_groups.keys())
-        for group_id in available_ids:
-            if len(data) >= target_data_size:
+        # Consume completed groups incrementally until we have enough accepted groups.
+        # Do NOT drain the entire queue; extra completed groups should remain queued for the next call.
+        while len(data) < target_data_size:
+            item = worker.try_get_completed_group()
+            if item is None:
                 break
-
-            group = completed_groups.pop(group_id)
+            group_id, group = item
+            last_progress_time = time.time()
+            processed_any = True
 
             # If any sample in the group was aborted, return the whole group to the data buffer
             # and do not forward it to the training engine.
@@ -201,6 +328,11 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> list[lis
                 any_aborted = False
 
             if any_aborted:
+                aborted_groups_requeued += 1
+                try:
+                    aborted_samples_requeued += sum(1 for sample in group if sample.status == Sample.Status.ABORTED)
+                except Exception:
+                    pass
                 try:
                     # add back to buffer so it can be retried or handled by buffer policy
                     data_buffer.add_samples([group])
@@ -209,6 +341,15 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> list[lis
                     print(f"Failed to return aborted group {group_id} to buffer: {e}", flush=True)
                 # don't count as processed for training
                 continue
+
+            # Version-aware offpolicyness drop (dequeue-time).
+            head_version = _get_group_head_version(group)
+            staleness = current_version - head_version
+            if staleness > max_head_offpolicyness:
+                stale_groups_dropped += 1
+                dropped_staleness_values.append(staleness)
+                continue
+            accepted_staleness_values.append(staleness)
 
             if do_print:
                 print(
@@ -220,7 +361,6 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> list[lis
 
             # Simplified: directly add samples, no filters used
             data.append(group)
-            processed_any = True
 
         # Check progress
         current_time = time.time()
@@ -247,15 +387,34 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> list[lis
         )
 
     data = sorted(data, key=lambda group: group[0].index)
-    return data
+    metrics = {
+        "async/queue_size_groups": worker.get_queue_size(),
+        "async/inflight_groups": worker.get_inflight_groups(),
+        "async/staleness_cap_batches": worker.staleness_cap_batches,
+        "async/aborted_groups_requeued": aborted_groups_requeued,
+        "async/aborted_samples_requeued": aborted_samples_requeued,
+        "async/producer_blocked_s": worker.get_producer_blocked_s() - start_blocked_s,
+        "async/producer_block_events": worker.get_producer_block_events() - start_blocked_events,
+        # Version-aware offpolicyness (based on train_async cadence).
+        "async/offpolicy_current_version": current_version,
+        "async/offpolicy_max_head_offpolicyness": max_head_offpolicyness,
+        "async/offpolicy_dropped_stale_groups": stale_groups_dropped,
+        "async/offpolicy_dropped_staleness_max": (
+            max(dropped_staleness_values) if dropped_staleness_values else 0
+        ),
+        "async/offpolicy_accepted_staleness_max": (
+            max(accepted_staleness_values) if accepted_staleness_values else 0
+        ),
+    }
+    return data, metrics
 
 
 def generate_rollout_fully_async(args, rollout_id, data_buffer, evaluation=False):
     if evaluation:
         raise ValueError("Evaluation mode not supported in simple async rollout")
 
-    completed_samples = run(generate_rollout_async(args, rollout_id, data_buffer))
-    return completed_samples
+    completed_samples, metrics = run(generate_rollout_async(args, rollout_id, data_buffer))
+    return RolloutFnTrainOutput(samples=completed_samples, metrics=metrics)
 
 
 # Register exit cleanup function
