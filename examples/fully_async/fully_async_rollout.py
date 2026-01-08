@@ -18,12 +18,15 @@ _worker_lock = threading.Lock()
 
 def _get_sample_head_version(sample: Sample) -> int:
     # Version awareness: use the first SGLang-reported weight_version (head).
-    assert sample.weight_versions, "Expected SGLang to return meta_info['weight_version'] (head version)."
+    if not sample.weight_versions:
+        raise RuntimeError("Expected SGLang to return meta_info['weight_version'] so we can enforce staleness.")
     return int(sample.weight_versions[0])
 
 
 def _get_group_head_version(group: list[Sample]) -> int:
     # Group head version for off-policyness drop (min across samples).
+    if not group:
+        raise RuntimeError("Unexpected empty group from generate_and_rm_group().")
     return min(_get_sample_head_version(sample) for sample in group)
 
 
@@ -49,7 +52,8 @@ def get_global_worker(args, data_buffer):
     with _worker_lock:
         if _global_worker is None or not _global_worker.worker_thread.is_alive():
             print("Creating new global async worker...")
-            _global_worker = AsyncRolloutWorker(args, data_buffer, concurrency=args.sglang_server_concurrency)
+            concurrency = getattr(args, "sglang_server_concurrency", 10) or 10
+            _global_worker = AsyncRolloutWorker(args, data_buffer, concurrency=concurrency)
             _global_worker.start()
         return _global_worker
 
@@ -77,7 +81,12 @@ class AsyncRolloutWorker:
         # Staleness cap (η): max off-policyness / staleness in units of trainer weight versions.
         # (We also use it to size default queue caps in groups: (η + 1) * rollout_batch_size.)
         self.staleness_cap_batches = int(os.environ.get("MAX_STALENESS_BATCHES", "4"))
-        b = max(1, int(getattr(self.args, "rollout_batch_size", 1)))
+        rollout_batch_size_raw = getattr(self.args, "rollout_batch_size", None)
+        try:
+            rollout_batch_size = int(rollout_batch_size_raw)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"Invalid args.rollout_batch_size={rollout_batch_size_raw!r}") from e
+        b = max(1, rollout_batch_size)
         default_queue_cap_groups = max(1, (self.staleness_cap_batches + 1) * b)
 
         # Optional knobs: allow overriding inflight and queue caps.
@@ -260,13 +269,19 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> tuple[li
     """
     Simplified asynchronous rollout generation - using global continuous worker
     """
-    assert args.rollout_global_dataset
+    if not getattr(args, "rollout_global_dataset", False):
+        raise ValueError("fully_async rollout requires --rollout-global-dataset")
 
     # Get global worker, which will run continuously
     worker = get_global_worker(args, data_buffer)
 
-    # Simplified: directly use rollout_batch_size as target
-    target_data_size = args.rollout_batch_size
+    target_data_size_raw = getattr(args, "rollout_batch_size", None)
+    try:
+        target_data_size = int(target_data_size_raw)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"Invalid args.rollout_batch_size={target_data_size_raw!r}") from e
+    if target_data_size < 1:
+        raise ValueError(f"Invalid args.rollout_batch_size={target_data_size_raw!r}; must be >= 1")
 
     data = []
     do_print = True
