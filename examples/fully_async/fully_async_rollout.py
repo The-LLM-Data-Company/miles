@@ -29,8 +29,17 @@ def _get_group_head_version(group: list[Sample]) -> int:
 
 def _derive_current_train_version(args, rollout_id: int) -> int:
     """Map rollout_id -> trainer weight version under `train_async.py` update cadence."""
-    update_interval = max(1, int(getattr(args, "update_weights_interval", 1)))
-    start_rollout_id = int(getattr(args, "start_rollout_id", 0))
+    update_interval_raw = getattr(args, "update_weights_interval", 1)
+    try:
+        update_interval = max(1, int(1 if update_interval_raw is None else update_interval_raw))
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"Invalid args.update_weights_interval={update_interval_raw!r}") from e
+
+    start_rollout_id_raw = getattr(args, "start_rollout_id", 0)
+    try:
+        start_rollout_id = int(0 if start_rollout_id_raw is None else start_rollout_id_raw)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"Invalid args.start_rollout_id={start_rollout_id_raw!r}") from e
     return 1 + max(0, rollout_id - start_rollout_id) // update_interval
 
 
