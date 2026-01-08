@@ -31,6 +31,7 @@ Continuous async rollout worker started
   * Backpressure: producer uses two hard caps: `inflight_groups <= MAX_INFLIGHT_GROUPS` and `queue_size_groups < QUEUE_CAP_GROUPS`.
   * Interrupt recovery: if a group is interrupted (`ABORTED`), it is pushed back into the data buffer for retry (KV recomputed on resume).
   * Off-policyness guardrail: at dequeue time, drop groups whose **head** `weight_version` is more than `η` versions behind the current training version.
+  * Dequeue ordering: completed groups are drained in order of `(head_weight_version, finished_ts)` (older-policy groups first).
 
 ### Limitations
 * No evaluation mode.

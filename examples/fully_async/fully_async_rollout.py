@@ -93,7 +93,9 @@ class AsyncRolloutWorker:
         self.max_inflight_groups = max(1, int(os.environ.get("MAX_INFLIGHT_GROUPS", str(b))))
         self.queue_cap_groups = max(1, int(os.environ.get("QUEUE_CAP_GROUPS", str(default_queue_cap_groups))))
 
-        self.output_queue = queue.Queue(maxsize=self.queue_cap_groups)  # Continuous output queue
+        # Completed groups are stored in a priority queue keyed by (head_weight_version, finished_ts, gid).
+        # This preferentially drains older-policy groups first (PipelineRL-style).
+        self.output_queue: queue.PriorityQueue = queue.PriorityQueue(maxsize=self.queue_cap_groups)
         self.worker_thread = None
         self.state = GenerateState(args)
 
@@ -174,14 +176,15 @@ class AsyncRolloutWorker:
                                     return
 
                                 # IMPORTANT: never block the asyncio event loop thread in a callback.
-                                # `queue.Queue.put()` can block when the queue is full and stall all async progress.
+                                # queue.put() can block when the queue is full and stall all async progress.
+                                item = ((_get_group_head_version(result), time.time(), gid), (gid, result))
                                 try:
-                                    self.output_queue.put_nowait((gid, result))
+                                    self.output_queue.put_nowait(item)
                                 except queue.Full:
                                     # Offload the blocking put to a daemon thread so the event loop can keep running.
                                     threading.Thread(
                                         target=self.output_queue.put,
-                                        args=((gid, result),),
+                                        args=(item,),
                                         daemon=True,
                                     ).start()
 
@@ -232,8 +235,8 @@ class AsyncRolloutWorker:
         completed = []
         while True:
             try:
-                result = self.output_queue.get_nowait()
-                completed.append(result)
+                _prio, item = self.output_queue.get_nowait()
+                completed.append(item)
             except queue.Empty:
                 break
         return completed
@@ -241,7 +244,8 @@ class AsyncRolloutWorker:
     def try_get_completed_group(self) -> tuple | None:
         """Try to get a single completed group without draining the entire queue."""
         try:
-            return self.output_queue.get_nowait()
+            _prio, item = self.output_queue.get_nowait()
+            return item
         except queue.Empty:
             return None
 
