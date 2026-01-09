@@ -81,8 +81,8 @@ class AsyncRolloutWorker:
         batch_size = max(1, args.rollout_batch_size)
         default_queue_cap = (self.staleness_cap_batches + 1) * batch_size
 
-        self.max_inflight_groups = int(os.environ.get("MAX_INFLIGHT_GROUPS", str(batch_size)))
-        self.queue_cap_groups = int(os.environ.get("QUEUE_CAP_GROUPS", str(default_queue_cap)))
+        self.max_inflight_groups = max(1, int(os.environ.get("MAX_INFLIGHT_GROUPS", str(batch_size))))
+        self.queue_cap_groups = max(1, int(os.environ.get("QUEUE_CAP_GROUPS", str(default_queue_cap))))
 
         self.output_queue: asyncio.PriorityQueue[PQItem] = asyncio.PriorityQueue(maxsize=self.queue_cap_groups)
         self._inflight_sem = asyncio.Semaphore(self.max_inflight_groups)
