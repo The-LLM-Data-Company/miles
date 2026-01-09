@@ -175,7 +175,7 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> tuple[li
     prompt_groups: list[list[Sample]] = []
     start_time = time.monotonic()
 
-    aborted_groups_requeued = 0
+    interrupted_groups_requeued = 0
     current_version = _get_current_train_version(args, rollout_id)
     max_staleness = worker.staleness_cap_batches
     stale_groups_dropped = 0
@@ -189,7 +189,7 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> tuple[li
         group = pq_item.samples
 
         if any(s.status == Sample.Status.ABORTED for s in group):
-            aborted_groups_requeued += 1
+            interrupted_groups_requeued += 1
             try:
                 data_buffer.add_samples([group])
             except Exception:
@@ -210,12 +210,13 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> tuple[li
     logger.info("Rollout consumer completed in %.2fs", time.monotonic() - start_time)
 
     prompt_groups = sorted(prompt_groups, key=lambda g: g[0].index)
-    total_consumed = len(prompt_groups) + stale_groups_dropped + aborted_groups_requeued
+    total_consumed = len(prompt_groups) + stale_groups_dropped + interrupted_groups_requeued
     return prompt_groups, {
         "async/queue_size_groups": worker.get_queue_size(),
         "async/inflight_groups": worker.get_inflight_groups(),
         "async/groups_consumed": total_consumed,
-        "async/aborted_groups_requeued": aborted_groups_requeued,
+        "async/interrupted_groups_requeued": interrupted_groups_requeued,
+        "async/interrupted_group_requeue_failures": interrupted_group_requeue_failures,
         "async/offpolicy_dropped_stale_groups": stale_groups_dropped,
         "async/offpolicy_drop_rate": stale_groups_dropped / total_consumed if total_consumed else 0,
         "async/offpolicy_accepted_staleness_mean": (
@@ -224,7 +225,6 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> tuple[li
         "async/offpolicy_accepted_staleness_max": max(accepted_staleness) if accepted_staleness else 0,
         "async/rollout_consumer_wait_secs": total_blocked_secs,
         "async/rollout_group_failures_total": worker.get_rollout_group_failures_total(),
-        "async/interrupted_group_requeue_failures": interrupted_group_requeue_failures,
     }
 
 
