@@ -175,6 +175,11 @@ class MegatronTrainRayActor(TrainRayActor):
 
         torch_memory_saver.resume()
 
+        # Free grad buffers immediately after resume — they are all zeros
+        # and not needed until backward pass. Saves ~16 GB for 8B models.
+        for model_chunk in self.model:
+            model_chunk.offload_grad_buffers()
+
         clear_memory()
         reload_process_groups()
         print_memory("after wake_up model")
@@ -382,6 +387,11 @@ class MegatronTrainRayActor(TrainRayActor):
             log_rollout_data(rollout_id, self.args, rollout_data, self.parallel_state)
 
             # Train
+            if self.args.offload_train:
+                for model_chunk in self.model:
+                    model_chunk.restore_grad_buffers()
+                print_memory("after restore_grad_buffers")
+
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
             with timer("actor_train"):
