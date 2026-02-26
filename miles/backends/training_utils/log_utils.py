@@ -124,6 +124,10 @@ def log_rollout_data(
                 "loss_masks",
                 "sample_indices",
                 "rollout_routed_experts",
+                # SDPO teacher top-k tensors are large and not meaningful as rollout summary stats.
+                # `teacher_topk_ids` is int64 and would fail on mean() without casting.
+                "teacher_topk_logprobs",
+                "teacher_topk_ids",
                 "max_seq_lens",
                 "dynamic_global_batch_size",
             ]:
