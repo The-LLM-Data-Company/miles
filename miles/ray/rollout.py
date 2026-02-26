@@ -411,6 +411,10 @@ class RolloutManager:
         if "teacher_log_probs" in samples[0].__dict__:
             train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
 
+        for _k in ("teacher_topk_logprobs", "teacher_topk_ids"):
+            if _k in samples[0].__dict__:
+                train_data[_k] = [getattr(sample, _k) for sample in samples]
+
         return train_data
 
     def set_train_parallel_config(self, config: dict):
@@ -450,6 +454,8 @@ class RolloutManager:
                 "rollout_routed_experts",
                 "prompt",
                 "teacher_log_probs",
+                "teacher_topk_logprobs",
+                "teacher_topk_ids",
             ]:
                 if key not in data:
                     continue
