@@ -456,6 +456,16 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--pin-rollout-manager-to-head",
+                action="store_true",
+                default=False,
+                help=(
+                    "Pin the RolloutManager (and its co-located router process) to the Ray head node. "
+                    "Useful in K8s where the head pod has a stable Service address so that "
+                    "external agent environments can reliably reach the router."
+                ),
+            )
+            parser.add_argument(
                 "--rollout-external",
                 action="store_true",
                 default=False,
