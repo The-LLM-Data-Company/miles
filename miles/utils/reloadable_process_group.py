@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 from contextlib import contextmanager
 
 import torch
@@ -131,19 +132,57 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
     @staticmethod
     def destroy_process_groups():
         pid = os.getpid()
-        for reloadable_group in ReloadableProcessGroup.GROUPS.get(pid, []):
+        reloadable_groups = ReloadableProcessGroup.GROUPS.get(pid, [])
+        logger.info(f"Destroying {len(reloadable_groups)} process groups in pid {pid}")
+        destroyed_groups = 0
+        destroy_start = time.perf_counter()
+
+        for idx, reloadable_group in enumerate(reloadable_groups):
             if reloadable_group.group is None:
                 continue
+            group = reloadable_group.group
+            group_name = None
             try:
-                dist.destroy_process_group(reloadable_group.group)
+                group_name = group.name()
+            except Exception:
+                group_name = None
+            logger.info(
+                "Destroying process group %s/%s in pid %s (group_name=%s, ranks=%s)",
+                idx + 1,
+                len(reloadable_groups),
+                pid,
+                group_name,
+                reloadable_group.group_info.get("ranks"),
+            )
+            group_destroy_start = time.perf_counter()
+            try:
+                dist.destroy_process_group(group)
             except ValueError as e:
                 logger.warning(
                     f"Process group already invalid/destroyed; skipping cleanup. Exception: {e}",
                     exc_info=True,
                 )
+            finally:
+                logger.info(
+                    "Finished destroying process group %s/%s in pid %s (group_name=%s) in %.3fs",
+                    idx + 1,
+                    len(reloadable_groups),
+                    pid,
+                    group_name,
+                    time.perf_counter() - group_destroy_start,
+                )
 
             del reloadable_group.group
             reloadable_group.group = None
+            destroyed_groups += 1
+
+        logger.info(
+            "Finished destroy_process_groups in pid %s (destroyed=%s/%s) in %.3fs",
+            pid,
+            destroyed_groups,
+            len(reloadable_groups),
+            time.perf_counter() - destroy_start,
+        )
 
     @staticmethod
     def reload_process_groups():

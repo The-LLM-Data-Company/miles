@@ -173,13 +173,21 @@ class MegatronTrainRayActor(TrainRayActor):
     def sleep(self) -> None:
         assert self.args.offload_train
 
+        logger.info("sleep(): begin offload sequence")
+        logger.info("sleep(): clear_memory(clear_host_memory=True) start")
         clear_memory(clear_host_memory=True)
+        logger.info("sleep(): clear_memory(clear_host_memory=True) end")
         print_memory("before offload model")
+        logger.info("sleep(): destroy_process_groups() start")
         destroy_process_groups()
+        logger.info("sleep(): destroy_process_groups() end")
 
+        logger.info("sleep(): torch_memory_saver.pause() start")
         torch_memory_saver.pause()
+        logger.info("sleep(): torch_memory_saver.pause() end")
 
         print_memory("after offload model")
+        logger.info("sleep(): end offload sequence")
 
         if self._is_main_rank and hasattr(self, "_last_rollout_id"):
             log_cpu_memory(self._last_rollout_id, self.args, "after_offload_train")
