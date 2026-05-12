@@ -74,7 +74,8 @@ def get_responses(
         assert max_seq_lens is not None
         logits = logits.view(-1, logits.size(-1))
 
-    logits = logits.div(args.rollout_temperature)
+    if args.rollout_temperature != 1:
+        logits = logits.div(args.rollout_temperature)
 
     cp_size = parallel_state.cp.size
     end = 0
@@ -590,13 +591,14 @@ def policy_loss_function(
     total_lengths = batch["total_lengths"]
     max_seq_lens = batch.get("max_seq_lens", None)
 
+    with_entropy = args.entropy_coef != 0
     log_probs_and_entropy = get_log_probs_and_entropy(
         logits,
         args=args,
         unconcat_tokens=batch["unconcat_tokens"],
         total_lengths=total_lengths,
         response_lengths=response_lengths,
-        with_entropy=True,
+        with_entropy=with_entropy,
         max_seq_lens=max_seq_lens,
     )
 
@@ -723,12 +725,16 @@ def policy_loss_function(
     pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
     ppo_kl = sum_of_sample_mean(ppo_kl)
 
-    # entropy loss
-    entropy = log_probs_and_entropy["entropy"]
-    entropy = torch.cat(entropy, dim=0)
-    entropy_loss = sum_of_sample_mean(entropy)
-
-    loss = pg_loss - args.entropy_coef * entropy_loss
+    # Entropy only belongs in the backward graph when it contributes to the loss.
+    # Collapse monitoring should use rollout entropy instead.
+    if with_entropy:
+        entropy = log_probs_and_entropy["entropy"]
+        entropy = torch.cat(entropy, dim=0)
+        entropy_loss = sum_of_sample_mean(entropy)
+        loss = pg_loss - args.entropy_coef * entropy_loss
+    else:
+        entropy_loss = pg_loss.detach().new_zeros(())
+        loss = pg_loss
 
     if args.use_kl_loss:
         ref_log_probs = batch["ref_log_probs"]
