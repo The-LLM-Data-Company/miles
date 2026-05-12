@@ -341,7 +341,6 @@ class RolloutManager:
         self.pg = pg
         self.args = args
         # TODO make args immutable
-        init_tracking(args, primary=False, router_addr=f"http://{args.sglang_router_ip}:{args.sglang_router_port}")
 
         data_source_cls = load_function(self.args.data_source_path)
         self.data_source = data_source_cls(args)
@@ -371,6 +370,12 @@ class RolloutManager:
             init_http_client(args)
             self.servers = start_rollout_servers(args, pg)
             _start_session_server(args)
+        router_addr = (
+            f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
+            if args.sglang_router_ip is not None and args.sglang_router_port is not None
+            else None
+        )
+        init_tracking(args, primary=False, router_addr=router_addr)
         self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
         self.rollout_id = -1
 
