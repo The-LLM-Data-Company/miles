@@ -50,15 +50,15 @@ class MilesRouter:
         self.worker_failure_counts: dict[str, int] = {}
         # Quarantined workers excluded from routing pool
         self.dead_workers: set[str] = set()
-        self.router_policy = getattr(args, "miles_router_policy", "least_loaded")
+        self.router_policy = args.miles_router_policy
         if self.router_policy not in ("least_loaded", "round_robin"):
             raise ValueError(
                 f"Unsupported miles_router_policy={self.router_policy!r}; "
                 "expected one of: least_loaded, round_robin"
             )
-        self.sticky_routing = getattr(args, "miles_router_sticky_routing", False)
-        self.routing_key_header = getattr(args, "miles_router_routing_key_header", "X-Miles-Routing-Key")
-        self.sticky_routing_max_keys = getattr(args, "miles_router_sticky_routing_max_keys", 100000)
+        self.sticky_routing = args.miles_router_sticky_routing
+        self.routing_key_header = args.miles_router_routing_key_header
+        self.sticky_routing_max_keys = args.miles_router_sticky_routing_max_keys
         if self.sticky_routing and self.sticky_routing_max_keys <= 0:
             raise ValueError("miles_router_sticky_routing_max_keys must be positive when sticky routing is enabled")
         self._round_robin_index = 0

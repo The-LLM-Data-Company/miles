@@ -24,6 +24,10 @@ def make_router_args(router_port: int, **overrides) -> Namespace:
         miles_router_max_connections=100,
         miles_router_timeout=None,
         miles_router_middleware_paths=[],
+        miles_router_policy="least_loaded",
+        miles_router_sticky_routing=False,
+        miles_router_routing_key_header="X-Miles-Routing-Key",
+        miles_router_sticky_routing_max_keys=100000,
     )
     defaults.update(overrides)
     return Namespace(**defaults)
