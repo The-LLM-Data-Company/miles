@@ -7,10 +7,11 @@ from argparse import Namespace
 
 import pytest
 import requests
+from fastapi import FastAPI
+from fastapi.responses import Response
 
-from miles.router.router import MilesRouter
+from miles.router.router import MilesRouter, _aggregate_prometheus_metrics
 from miles.utils.http_utils import find_available_port
-from miles.utils.test_utils.mock_sglang_server import MockSGLangServer, default_process_fn
 from miles.utils.test_utils.uvicorn_thread_server import UvicornThreadServer
 
 
@@ -28,7 +29,9 @@ def make_router_args(router_port: int, **overrides) -> Namespace:
     return Namespace(**defaults)
 
 
-def create_mock_worker(start_port: int = 30000) -> MockSGLangServer:
+def create_mock_worker(start_port: int = 30000):
+    from miles.utils.test_utils.mock_sglang_server import MockSGLangServer, default_process_fn
+
     port = find_available_port(start_port)
     return MockSGLangServer(
         model_name="Qwen/Qwen3-0.6B",
@@ -37,6 +40,22 @@ def create_mock_worker(start_port: int = 30000) -> MockSGLangServer:
         port=port,
         latency=0.0,
     )
+
+
+def create_metrics_worker(metrics_text: str, start_port: int = 31000) -> UvicornThreadServer:
+    app = FastAPI()
+
+    @app.get("/health")
+    async def health():
+        return {"status": "ok"}
+
+    @app.get("/metrics")
+    async def metrics():
+        return Response(content=metrics_text, media_type="text/plain")
+
+    server = UvicornThreadServer(app, host="127.0.0.1", port=find_available_port(start_port))
+    server.start()
+    return server
 
 
 class RouterEnv:
@@ -160,9 +179,146 @@ class TestLoadBalancing:
             router._use_url()
 
 
+class TestEngineMetrics:
+    def test_aggregate_prometheus_metrics_adds_worker_label_and_normalizes_names(self):
+        result = _aggregate_prometheus_metrics(
+            [
+                (
+                    "http://worker:1234",
+                    "\n".join(
+                        [
+                            "# HELP sglang:num_running_reqs The number of running requests",
+                            "# TYPE sglang:num_running_reqs gauge",
+                            'sglang:num_running_reqs{model_name="m"} 3',
+                            "# TYPE sglang:generation_tokens_total counter",
+                            "sglang:generation_tokens_total 10",
+                        ]
+                    ),
+                )
+            ]
+        )
+
+        assert "# HELP sglang_num_running_reqs The number of running requests" in result
+        assert "# TYPE sglang_num_running_reqs gauge" in result
+        assert 'sglang_num_running_reqs{model_name="m",worker_addr="http://worker:1234"} 3' in result
+        assert 'sglang_generation_tokens_total{worker_addr="http://worker:1234"} 10' in result
+
+    def test_aggregate_prometheus_metrics_deduplicates_metadata(self):
+        metric_text = "\n".join(
+            [
+                "# HELP sglang:num_queue_reqs queued",
+                "# TYPE sglang:num_queue_reqs gauge",
+                'sglang:num_queue_reqs{model_name="m"} 1',
+            ]
+        )
+
+        result = _aggregate_prometheus_metrics(
+            [
+                ("http://worker1:30000", metric_text),
+                ("http://worker2:30000", metric_text.replace(" 1", " 2")),
+            ]
+        )
+
+        assert result.count("# HELP sglang_num_queue_reqs queued") == 1
+        assert result.count("# TYPE sglang_num_queue_reqs gauge") == 1
+        assert 'worker_addr="http://worker1:30000"' in result
+        assert 'worker_addr="http://worker2:30000"' in result
+
+    def test_aggregate_prometheus_metrics_handles_escaped_labels_and_invalid_lines(self):
+        result = _aggregate_prometheus_metrics(
+            [
+                (
+                    'http://worker\\"1:30000',
+                    "\n".join(
+                        [
+                            'sglang:func_latency_seconds_bucket{name="a}b",le="+Inf"} 12',
+                            "not_a_metric no_numeric_value",
+                        ]
+                    ),
+                )
+            ]
+        )
+
+        assert (
+            'sglang_func_latency_seconds_bucket{name="a}b",le="+Inf",'
+            'worker_addr="http://worker\\\\\\"1:30000"} 12'
+        ) in result
+        assert "not_a_metric" not in result
+
+    def test_engine_metrics_scrapes_multiple_workers(self, router_env: RouterEnv):
+        worker1 = create_metrics_worker(
+            "\n".join(
+                [
+                    "# HELP sglang:num_running_reqs running",
+                    "# TYPE sglang:num_running_reqs gauge",
+                    'sglang:num_running_reqs{model_name="m"} 3',
+                ]
+            ),
+            start_port=31000,
+        )
+        worker2 = create_metrics_worker(
+            "\n".join(
+                [
+                    "# HELP sglang:num_running_reqs running",
+                    "# TYPE sglang:num_running_reqs gauge",
+                    'sglang:num_running_reqs{model_name="m"} 7',
+                ]
+            ),
+            start_port=31100,
+        )
+        try:
+            requests.post(f"{router_env.url}/add_worker", params={"url": worker1.url}, timeout=5.0).raise_for_status()
+            requests.post(f"{router_env.url}/add_worker", params={"url": worker2.url}, timeout=5.0).raise_for_status()
+
+            response = requests.get(f"{router_env.url}/engine_metrics", timeout=5.0)
+            response.raise_for_status()
+            text = response.text
+
+            assert 'sglang_num_running_reqs{model_name="m",worker_addr="' in text
+            assert f'worker_addr="{worker1.url}"' in text
+            assert f'worker_addr="{worker2.url}"' in text
+            assert text.count("# TYPE sglang_num_running_reqs gauge") == 1
+        finally:
+            worker1.stop()
+            worker2.stop()
+
+    def test_engine_metrics_skips_failed_workers(self, router_env: RouterEnv):
+        worker = create_metrics_worker("# TYPE sglang:token_usage gauge\nsglang:token_usage 0.5\n")
+        bad_worker_url = "http://127.0.0.1:59999"
+        try:
+            requests.post(f"{router_env.url}/add_worker", params={"url": worker.url}, timeout=5.0).raise_for_status()
+            requests.post(f"{router_env.url}/add_worker", params={"url": bad_worker_url}, timeout=5.0).raise_for_status()
+
+            response = requests.get(f"{router_env.url}/engine_metrics", timeout=5.0)
+            response.raise_for_status()
+
+            assert f'worker_addr="{worker.url}"' in response.text
+            assert bad_worker_url not in response.text
+        finally:
+            worker.stop()
+
+    def test_engine_metrics_returns_503_with_no_workers(self, router_env: RouterEnv):
+        response = requests.get(f"{router_env.url}/engine_metrics", timeout=5.0)
+
+        assert response.status_code == 503
+        assert response.json()["error"] == "No available workers"
+
+    def test_engine_metrics_returns_503_when_all_workers_fail(self, router_env: RouterEnv):
+        requests.post(
+            f"{router_env.url}/add_worker",
+            params={"url": "http://127.0.0.1:59999"},
+            timeout=5.0,
+        ).raise_for_status()
+
+        response = requests.get(f"{router_env.url}/engine_metrics", timeout=5.0)
+
+        assert response.status_code == 503
+        assert response.json()["error"] == "All backend metrics requests failed"
+
+
 # TODO: extract main body inside `_health_check_loop`, then can test that function
 class TestHealthCheck:
-    def test_check_worker_health_success(self, router_factory, mock_worker: MockSGLangServer):
+    def test_check_worker_health_success(self, router_factory, mock_worker):
         router = router_factory()
         url, healthy = asyncio.run(router._check_worker_health(mock_worker.url))
         assert url == mock_worker.url
@@ -176,7 +332,7 @@ class TestHealthCheck:
 
 
 class TestProxyIntegration:
-    def test_proxy_forwards_request(self, router_env: RouterEnv, mock_worker: MockSGLangServer):
+    def test_proxy_forwards_request(self, router_env: RouterEnv, mock_worker):
         requests.post(f"{router_env.url}/add_worker", params={"url": mock_worker.url}, timeout=5.0).raise_for_status()
 
         payload = {"input_ids": [1, 2, 3], "return_logprob": True}
@@ -200,7 +356,7 @@ class TestProxyIntegration:
         assert len(all_requests) == 4
         assert all(req == payload for req in all_requests)
 
-    def test_proxy_health_endpoint(self, router_env: RouterEnv, mock_worker: MockSGLangServer):
+    def test_proxy_health_endpoint(self, router_env: RouterEnv, mock_worker):
         requests.post(f"{router_env.url}/add_worker", params={"url": mock_worker.url}, timeout=5.0)
 
         r = requests.get(f"{router_env.url}/health", timeout=5.0)
