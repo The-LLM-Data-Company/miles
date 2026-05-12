@@ -7,7 +7,7 @@ from argparse import Namespace
 
 import pytest
 import requests
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import Response
 
 from miles.router.router import MilesRouter, _aggregate_prometheus_metrics
@@ -58,6 +58,37 @@ def create_metrics_worker(metrics_text: str, start_port: int = 31000) -> Uvicorn
     return server
 
 
+class GenerateWorker:
+    def __init__(self, server: UvicornThreadServer, request_log: list[dict]):
+        self.server = server
+        self.request_log = request_log
+
+    @property
+    def url(self) -> str:
+        return self.server.url
+
+    def stop(self):
+        self.server.stop()
+
+
+def create_generate_worker(start_port: int = 32000) -> GenerateWorker:
+    app = FastAPI()
+    request_log = []
+
+    @app.get("/health")
+    async def health():
+        return {"status": "ok"}
+
+    @app.post("/generate")
+    async def generate(request: Request):
+        request_log.append(await request.json())
+        return {"text": "ok", "meta_info": {}}
+
+    server = UvicornThreadServer(app, host="127.0.0.1", port=find_available_port(start_port))
+    server.start()
+    return GenerateWorker(server, request_log)
+
+
 class RouterEnv:
     def __init__(self, router: MilesRouter, server: UvicornThreadServer):
         self.router = router
@@ -79,6 +110,24 @@ def router_env():
 
 
 @pytest.fixture
+def router_env_factory():
+    servers = []
+
+    def _create(**overrides):
+        args = make_router_args(find_available_port(20000), **overrides)
+        router = MilesRouter(args, verbose=False)
+        server = UvicornThreadServer(router.app, host=args.sglang_router_ip, port=args.sglang_router_port)
+        server.start()
+        env = RouterEnv(router, server)
+        servers.append(server)
+        return env
+
+    yield _create
+    for server in servers:
+        server.stop()
+
+
+@pytest.fixture
 def mock_worker():
     server = create_mock_worker()
     server.start()
@@ -94,6 +143,21 @@ def mock_worker_factory():
         start_port = 30000 + len(servers) * 100
         server = create_mock_worker(start_port)
         server.start()
+        servers.append(server)
+        return server
+
+    yield _create
+    for s in servers:
+        s.stop()
+
+
+@pytest.fixture
+def generate_worker_factory():
+    servers = []
+
+    def _create():
+        start_port = 32000 + len(servers) * 100
+        server = create_generate_worker(start_port)
         servers.append(server)
         return server
 
@@ -161,6 +225,29 @@ class TestLoadBalancing:
         assert selected == "http://w2:8000"
         assert router.worker_request_counts["http://w2:8000"] == 3
 
+    def test_least_loaded_ties_rotate(self, router_factory):
+        router = router_factory(miles_router_policy="least_loaded")
+        router.worker_request_counts = {"http://w1:8000": 0, "http://w2:8000": 0, "http://w3:8000": 3}
+
+        first = router._use_url()
+        router._finish_url(first)
+        second = router._use_url()
+
+        assert first == "http://w1:8000"
+        assert second == "http://w2:8000"
+
+    def test_round_robin_policy_rotates_healthy_workers(self, router_factory):
+        router = router_factory(miles_router_policy="round_robin")
+        router.worker_request_counts = {"http://w1:8000": 0, "http://w2:8000": 0, "http://w3:8000": 0}
+
+        selected = []
+        for _ in range(4):
+            url = router._use_url()
+            selected.append(url)
+            router._finish_url(url)
+
+        assert selected == ["http://w1:8000", "http://w2:8000", "http://w3:8000", "http://w1:8000"]
+
     def test_use_url_excludes_dead_workers(self, router_factory):
         router = router_factory()
         router.worker_request_counts = {"http://w1:8000": 5, "http://w2:8000": 1, "http://w3:8000": 3}
@@ -177,6 +264,73 @@ class TestLoadBalancing:
 
         with pytest.raises(RuntimeError, match="No healthy workers"):
             router._use_url()
+
+    def test_sticky_routing_reuses_worker_for_key(self, router_factory):
+        router = router_factory(miles_router_policy="round_robin", miles_router_sticky_routing=True)
+        router.worker_request_counts = {"http://w1:8000": 0, "http://w2:8000": 0}
+
+        first = router._use_url(routing_key="trace-a")
+        router._finish_url(first)
+        second = router._use_url(routing_key="trace-a")
+
+        assert first == "http://w1:8000"
+        assert second == "http://w1:8000"
+        assert router._routing_table["trace-a"] == "http://w1:8000"
+
+    def test_sticky_routing_assigns_new_keys_by_policy(self, router_factory):
+        router = router_factory(miles_router_policy="round_robin", miles_router_sticky_routing=True)
+        router.worker_request_counts = {"http://w1:8000": 0, "http://w2:8000": 0}
+
+        first = router._use_url(routing_key="trace-a")
+        router._finish_url(first)
+        second = router._use_url(routing_key="trace-b")
+
+        assert first == "http://w1:8000"
+        assert second == "http://w2:8000"
+
+    def test_sticky_routing_remaps_dead_worker(self, router_factory):
+        router = router_factory(miles_router_policy="round_robin", miles_router_sticky_routing=True)
+        router.worker_request_counts = {"http://w1:8000": 0, "http://w2:8000": 0}
+
+        first = router._use_url(routing_key="trace-a")
+        router._finish_url(first)
+        router.dead_workers = {"http://w1:8000"}
+        remapped = router._use_url(routing_key="trace-a")
+
+        assert first == "http://w1:8000"
+        assert remapped == "http://w2:8000"
+        assert router._routing_table["trace-a"] == "http://w2:8000"
+
+    def test_sticky_routing_evicts_oldest_key(self, router_factory):
+        router = router_factory(
+            miles_router_policy="round_robin",
+            miles_router_sticky_routing=True,
+            miles_router_sticky_routing_max_keys=1,
+        )
+        router.worker_request_counts = {"http://w1:8000": 0, "http://w2:8000": 0}
+
+        first = router._use_url(routing_key="trace-a")
+        router._finish_url(first)
+        router._use_url(routing_key="trace-b")
+
+        assert list(router._routing_table.keys()) == ["trace-b"]
+
+    def test_get_routing_key_uses_configured_header_and_smg_fallback(self, router_factory):
+        router = router_factory(
+            miles_router_sticky_routing=True,
+            miles_router_routing_key_header="X-Trace-Id",
+        )
+
+        assert router._get_routing_key({"X-Trace-Id": "trace-a"}) == "trace-a"
+        assert router._get_routing_key({"X-SMG-Routing-Key": "trace-b"}) == "trace-b"
+        assert (
+            router._get_routing_key({"X-Trace-Id": "trace-a", "X-SMG-Routing-Key": "trace-b"}) == "trace-a"
+        )
+
+    def test_get_routing_key_ignored_when_sticky_disabled(self, router_factory):
+        router = router_factory(miles_router_sticky_routing=False)
+
+        assert router._get_routing_key({"X-Miles-Routing-Key": "trace-a"}) is None
 
 
 class TestEngineMetrics:
@@ -355,6 +509,30 @@ class TestProxyIntegration:
         all_requests = worker1.request_log + worker2.request_log
         assert len(all_requests) == 4
         assert all(req == payload for req in all_requests)
+
+    def test_proxy_sticky_routing_uses_request_header(self, router_env_factory, generate_worker_factory):
+        router_env = router_env_factory(miles_router_policy="round_robin", miles_router_sticky_routing=True)
+        worker1, worker2 = generate_worker_factory(), generate_worker_factory()
+        requests.post(f"{router_env.url}/add_worker", params={"url": worker1.url}, timeout=5.0).raise_for_status()
+        requests.post(f"{router_env.url}/add_worker", params={"url": worker2.url}, timeout=5.0).raise_for_status()
+
+        payload = {"input_ids": [1, 2, 3], "return_logprob": True}
+        for _ in range(2):
+            requests.post(
+                f"{router_env.url}/generate",
+                json=payload,
+                headers={"X-Miles-Routing-Key": "trace-a"},
+                timeout=10.0,
+            ).raise_for_status()
+        requests.post(
+            f"{router_env.url}/generate",
+            json=payload,
+            headers={"X-Miles-Routing-Key": "trace-b"},
+            timeout=10.0,
+        ).raise_for_status()
+
+        assert len(worker1.request_log) == 2
+        assert len(worker2.request_log) == 1
 
     def test_proxy_health_endpoint(self, router_env: RouterEnv, mock_worker):
         requests.post(f"{router_env.url}/add_worker", params={"url": mock_worker.url}, timeout=5.0)

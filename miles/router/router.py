@@ -3,6 +3,8 @@ import asyncio
 import json
 import logging
 import re
+from collections import OrderedDict
+from collections.abc import Mapping
 
 import httpx
 import setproctitle
@@ -48,6 +50,19 @@ class MilesRouter:
         self.worker_failure_counts: dict[str, int] = {}
         # Quarantined workers excluded from routing pool
         self.dead_workers: set[str] = set()
+        self.router_policy = getattr(args, "miles_router_policy", "least_loaded")
+        if self.router_policy not in ("least_loaded", "round_robin"):
+            raise ValueError(
+                f"Unsupported miles_router_policy={self.router_policy!r}; "
+                "expected one of: least_loaded, round_robin"
+            )
+        self.sticky_routing = getattr(args, "miles_router_sticky_routing", False)
+        self.routing_key_header = getattr(args, "miles_router_routing_key_header", "X-Miles-Routing-Key")
+        self.sticky_routing_max_keys = getattr(args, "miles_router_sticky_routing_max_keys", 100000)
+        if self.sticky_routing and self.sticky_routing_max_keys <= 0:
+            raise ValueError("miles_router_sticky_routing_max_keys must be positive when sticky routing is enabled")
+        self._round_robin_index = 0
+        self._routing_table: OrderedDict[str, str] = OrderedDict()
         self.max_weight_version = None
 
         max_connections = getattr(args, "miles_router_max_connections", None)
@@ -151,13 +166,15 @@ class MilesRouter:
         headers: dict | None = None,
     ) -> dict:
         """Core proxy logic. Returns dict with request_body, response_body, status_code, headers."""
-        worker_url = self._use_url()
+        if headers is None:
+            headers = dict(request.headers)
+        routing_key = self._get_routing_key(headers)
+
+        worker_url = self._use_url(routing_key=routing_key)
         url = f"{worker_url}/{path}"
 
         if body is None:
             body = await request.body()
-        if headers is None:
-            headers = dict(request.headers)
         if body is not None:
             headers = {k: v for k, v in headers.items() if k.lower() not in ("content-length", "transfer-encoding")}
 
@@ -259,19 +276,65 @@ class MilesRouter:
             logger.debug("[miles-router] Worker %s metrics scrape failed: %s", worker_url, e)
             return worker_url, None
 
-    def _use_url(self):
-        """Select worker URL with minimal active requests."""
+    def _healthy_workers(self) -> list[str]:
+        return [w for w in self.worker_request_counts if w not in self.dead_workers]
 
-        if not self.dead_workers:
-            # Healthy path: select from all workers
-            url = min(self.worker_request_counts, key=self.worker_request_counts.get)
+    @staticmethod
+    def _get_header(headers: Mapping[str, str], name: str) -> str | None:
+        for key, value in headers.items():
+            if key.lower() == name.lower():
+                return value
+        return None
+
+    def _get_routing_key(self, headers: Mapping[str, str]) -> str | None:
+        if not self.sticky_routing:
+            return None
+
+        routing_key = self._get_header(headers, self.routing_key_header)
+        if routing_key is None and self.routing_key_header.lower() != "x-smg-routing-key":
+            routing_key = self._get_header(headers, "X-SMG-Routing-Key")
+        return routing_key
+
+    def _select_round_robin(self, workers: list[str]) -> str:
+        if not workers:
+            raise RuntimeError("No healthy workers available in the pool")
+        url = workers[self._round_robin_index % len(workers)]
+        self._round_robin_index = (self._round_robin_index + 1) % len(workers)
+        return url
+
+    def _select_worker(self, workers: list[str]) -> str:
+        if self.router_policy == "round_robin":
+            return self._select_round_robin(workers)
+
+        if not workers:
+            raise RuntimeError("No healthy workers available in the pool")
+        min_load = min(self.worker_request_counts[w] for w in workers)
+        least_loaded_workers = [w for w in workers if self.worker_request_counts[w] == min_load]
+        return self._select_round_robin(least_loaded_workers)
+
+    def _remember_routing_key(self, routing_key: str, url: str) -> None:
+        self._routing_table[routing_key] = url
+        self._routing_table.move_to_end(routing_key)
+        while len(self._routing_table) > self.sticky_routing_max_keys:
+            self._routing_table.popitem(last=False)
+
+    def _use_url(self, routing_key: str | None = None):
+        """Select a worker URL according to the configured router policy."""
+
+        workers = self._healthy_workers()
+        if not workers:
+            raise RuntimeError("No healthy workers available in the pool")
+
+        if self.sticky_routing and routing_key:
+            mapped_url = self._routing_table.get(routing_key)
+            if mapped_url in workers:
+                url = mapped_url
+                self._routing_table.move_to_end(routing_key)
+            else:
+                url = self._select_worker(workers)
+                self._remember_routing_key(routing_key, url)
         else:
-            # Degraded path: select from workers not in dead_workers
-            valid_workers = (w for w in self.worker_request_counts if w not in self.dead_workers)
-            try:
-                url = min(valid_workers, key=self.worker_request_counts.get)
-            except ValueError:
-                raise RuntimeError("No healthy workers available in the pool") from None
+            url = self._select_worker(workers)
 
         self.worker_request_counts[url] += 1
         return url
@@ -406,6 +469,31 @@ if __name__ == "__main__":
     parser.add_argument("--sglang-port", type=int, required=True)
     parser.add_argument("--tokenizer-name", type=str, help="Name of the tokenizer to use for tokenization")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
+    parser.add_argument(
+        "--miles-router-policy",
+        type=str,
+        choices=("least_loaded", "round_robin"),
+        default="least_loaded",
+        help="Routing policy for MilesRouter workers.",
+    )
+    parser.add_argument(
+        "--miles-router-sticky-routing",
+        action="store_true",
+        default=False,
+        help="Route requests with the same routing key header to the same healthy worker.",
+    )
+    parser.add_argument(
+        "--miles-router-routing-key-header",
+        type=str,
+        default="X-Miles-Routing-Key",
+        help="Header used as the sticky routing key.",
+    )
+    parser.add_argument(
+        "--miles-router-sticky-routing-max-keys",
+        type=int,
+        default=100000,
+        help="Maximum sticky routing keys retained by MilesRouter.",
+    )
 
     args = parser.parse_args()
 
