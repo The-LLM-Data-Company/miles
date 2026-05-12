@@ -1136,6 +1136,31 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="Timeout for MilesRouter HTTP requests in seconds.",
             )
             parser.add_argument(
+                "--miles-router-policy",
+                type=str,
+                choices=("least_loaded", "round_robin"),
+                default="least_loaded",
+                help="Routing policy for MilesRouter workers.",
+            )
+            parser.add_argument(
+                "--miles-router-sticky-routing",
+                action="store_true",
+                default=False,
+                help="Route requests with the same routing key header to the same healthy MilesRouter worker.",
+            )
+            parser.add_argument(
+                "--miles-router-routing-key-header",
+                type=str,
+                default="X-Miles-Routing-Key",
+                help="Header used as the MilesRouter sticky routing key.",
+            )
+            parser.add_argument(
+                "--miles-router-sticky-routing-max-keys",
+                type=int,
+                default=100000,
+                help="Maximum sticky routing keys retained by MilesRouter.",
+            )
+            parser.add_argument(
                 "--miles-router-max-connections",
                 type=int,
                 default=None,
